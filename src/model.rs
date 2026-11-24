@@ -220,19 +220,6 @@ impl Run {
     pub fn actor_login(&self) -> &str {
         self.actor.as_ref().map(|a| a.login.as_str()).unwrap_or("?")
     }
-
-    /// `pull_request` is the long way to say `pr`. The same abbreviations the
-    /// fzf list used, so the column reads the same width.
-    pub fn event_short(&self) -> &str {
-        match self.event.as_str() {
-            "pull_request" => "pr",
-            "pull_request_target" => "pr-tgt",
-            "workflow_dispatch" => "manual",
-            "schedule" => "cron",
-            "dynamic" => "dyn",
-            other => other,
-        }
-    }
 }
 
 impl Job {

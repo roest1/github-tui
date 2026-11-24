@@ -44,25 +44,13 @@ use std::time::{Duration, Instant};
 
 use tui_core::{nav::Action, Flow, Pane, Row, Screen, Tick};
 
-use crate::gh::{Fetcher, Got, Req};
+use crate::gh::{self, Fetcher, Got, Maybe, Req, IN_FLIGHT};
 use crate::index::Repo;
-use crate::model::Run;
+use crate::model::{Job, Run};
 use crate::paint::{DIM, OFF, ORG};
+use crate::scopes::Denied;
 use crate::steps::Steps;
-use crate::{render, time};
-
-/// How often to look again while a `gh` call is in flight.
-///
-/// `Tick::Busy` is the obvious answer and is the wrong one here. It means "wake
-/// me next frame", which is right for work that lands in milliseconds -- the
-/// font browser rasterising a specimen -- and wasteful for a network round trip
-/// measured in hundreds. Polling at 60fps through a one-second fetch is ~60
-/// redraws to notice something that could not possibly have arrived sooner,
-/// and it is the screen, not the loop, that knows which kind of work it started.
-///
-/// A tenth of a second is far below the point where a response landing feels
-/// delayed, and it is a sixth of the frames.
-const IN_FLIGHT: Duration = Duration::from_millis(100);
+use crate::{logs, render, time};
 
 const LIST_EVERY: Duration = Duration::from_secs(15);
 const JOBS_EVERY: Duration = Duration::from_secs(5);
@@ -120,24 +108,116 @@ pub(crate) fn short(sha: &str) -> &str {
 /// meaning of a query parameter -- `feat/x+y` would otherwise ask for the
 /// branch `feat/x y`. Only unreserved characters pass through.
 pub(crate) fn urlencode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for b in s.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(b as char)
-            }
-            _ => out.push_str(&format!("%{b:02X}")),
-        }
+    gh::percent(s, b"")
+}
+
+/// What `r` says while its answer is on the way, kept as a constant so the
+/// arrival can recognise the line and take it down. Left up, the pane went on
+/// saying "refreshing" under a list that had already been refreshed.
+pub(crate) const REFRESHING: &str = "refreshing\u{2026}";
+
+/// The answer to `r` is in: take down the line that said it was coming.
+pub(crate) fn refreshed(status: &mut String) {
+    if status == REFRESHING {
+        status.clear();
     }
-    out
+}
+
+/// Is `got` an answer this screen has not read yet?
+///
+/// The fetcher hands out each answer behind an `Arc` and makes a new one per
+/// arrival, so two reads of the same arrival are the same pointer. That is
+/// what tells "the list came back" from "something else came back and the
+/// list is still the one from before" -- a difference `Fetcher::epoch` cannot
+/// see, because every arrival moves it.
+pub(crate) fn arrived<T>(seen: &Option<Arc<T>>, got: &Arc<T>) -> bool {
+    !seen.as_ref().is_some_and(|s| Arc::ptr_eq(s, got))
+}
+
+/// A refusal, as the line that changes it. See `scopes`.
+pub(crate) fn denied(d: &Denied) -> String {
+    format!("this token lacks the scope \u{2014} {}", d.fix())
+}
+
+/// An answer in the three states a fetch has. `pick` takes the payload out
+/// of the one variant that carries it; any other is still on its way.
+fn answer<T>(got: Option<Got>, pick: impl FnOnce(Got) -> Option<T>) -> Maybe<T> {
+    match got {
+        Some(Got::Denied(d)) => Maybe::Cannot(denied(&d)),
+        Some(Got::Failed(e)) => Maybe::Cannot(e),
+        Some(got) => pick(got).map_or(Maybe::Waiting, Maybe::Got),
+        None => Maybe::Waiting,
+    }
+}
+
+/// One run's jobs.
+fn jobs_answer(got: Option<Got>) -> Maybe<Arc<Vec<Job>>> {
+    answer(got, |got| match got {
+        Got::Jobs(j) => Some(j),
+        _ => None,
+    })
+}
+
+/// One job's log. Shared, not copied: it can be megabytes, and every caller
+/// only reads it.
+pub(crate) fn log_answer(got: Option<Got>) -> Maybe<Arc<String>> {
+    answer(got, |got| match got {
+        Got::Log(l) => Some(l),
+        _ => None,
+    })
+}
+
+/// Have these jobs all finished? An empty list has not: it is a run still
+/// waiting for a runner.
+pub(crate) fn all_completed(jobs: &[Job]) -> bool {
+    !jobs.is_empty() && jobs.iter().all(Job::has_log)
 }
 
 /// A destructive action waiting on one more keystroke.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Confirm {
     Rerun,
     RerunFailed,
     Cancel,
+}
+
+/// A confirm in force: what was asked, and of WHICH run.
+///
+/// The run is held by id, not by where the cursor was. The list is replaced
+/// under the cursor every time a refresh lands, and a push puts a new run in
+/// row 0 -- so a prompt that remembered only its verb said "rerun #41" and
+/// then, on `y`, reran whatever had moved into that row since.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Pending {
+    what: Confirm,
+    id: u64,
+    number: u64,
+}
+
+impl Pending {
+    /// The `gh` arguments that do it.
+    ///
+    /// `--repo` on every one. `github` is launched from anywhere, and without
+    /// it `gh run` resolves the repository from the working directory: an
+    /// error outside a clone, and inside a DIFFERENT clone a rerun or a
+    /// cancel sent to that repository's run of the same id.
+    fn argv(&self, repo: &str) -> Vec<String> {
+        let verb = match self.what {
+            Confirm::Cancel => "cancel",
+            Confirm::Rerun | Confirm::RerunFailed => "rerun",
+        };
+        let mut argv = vec![
+            "run".to_string(),
+            verb.to_string(),
+            self.id.to_string(),
+            "--repo".to_string(),
+            repo.to_string(),
+        ];
+        if self.what == Confirm::RerunFailed {
+            argv.push("--failed".to_string());
+        }
+        argv
+    }
 }
 
 pub struct Actions {
@@ -165,6 +245,9 @@ pub struct Actions {
     /// asking for them again one keystroke later.
     fetch: Arc<Fetcher>,
     runs: Vec<Run>,
+    /// The list answer `runs` was read from, to tell its next arrival from
+    /// everything else that lands. See `arrived`.
+    list_seen: Option<Arc<Vec<Run>>>,
     /// True when the repo has more than one workflow, which is the only time
     /// naming the workflow distinguishes anything.
     multi: bool,
@@ -174,7 +257,9 @@ pub struct Actions {
     list_due: Option<Instant>,
     jobs_due: Option<Instant>,
     sel: usize,
-    pending: Option<Confirm>,
+    pending: Option<Pending>,
+    /// What `y` has sent and GitHub has not answered yet. See `act`.
+    sent: Vec<Pending>,
 }
 
 impl Actions {
@@ -214,6 +299,7 @@ impl Actions {
             head_sha,
             commit: None,
             runs: Vec::new(),
+            list_seen: None,
             multi: false,
             error: None,
             status: String::new(),
@@ -222,6 +308,7 @@ impl Actions {
             jobs_due: None,
             sel: 0,
             pending: None,
+            sent: Vec::new(),
         };
         me.fetch.request(me.list_req());
         Some(me)
@@ -250,6 +337,7 @@ impl Actions {
             head_sha: Some(sha.to_string()),
             commit: Some(sha.to_string()),
             runs: Vec::new(),
+            list_seen: None,
             multi: false,
             error: None,
             status: String::new(),
@@ -258,6 +346,7 @@ impl Actions {
             jobs_due: None,
             sel: 0,
             pending: None,
+            sent: Vec::new(),
         };
         me.fetch.request(me.list_req());
         me
@@ -287,42 +376,95 @@ impl Actions {
         }
     }
 
+    /// The run drawn at row `sel`.
+    ///
+    /// None of them while the list could not be read: `rows()` then draws ONE
+    /// row saying so, and the runs from before the failure are still held
+    /// here underneath it. Resolving row 0 to the first of those let `e` and
+    /// then `y` rerun a run that was not on screen, behind an error pane that
+    /// never showed the prompt. This is the screen's row walk, so every key
+    /// and both clocks get the same answer `rows()` drew.
     fn run(&self, sel: usize) -> Option<&Run> {
+        if self.error.is_some() {
+            return None;
+        }
         self.runs.get(sel)
+    }
+
+    /// Whether the selected run's jobs are worth asking for again.
+    ///
+    /// A run still going, whose jobs in hand have not all finished. Once they
+    /// have, another poll can only return the same thing -- unless the run
+    /// has more jobs to create, and the list is what knows that. See `sync`.
+    fn watching(&self, sel: usize) -> bool {
+        self.run(sel).is_some_and(|run| {
+            !run.verdict().done()
+                && !matches!(self.jobs_of(run), Maybe::Got(jobs) if all_completed(&jobs))
+        })
     }
 
     /// Pull whatever has landed into our own state.
     fn sync(&mut self) {
-        if let Some(got) = self.fetch.get(&self.list_req()) {
-            match got {
-                Got::Runs(runs) => {
+        self.hear_back();
+        let now = Instant::now();
+        // Did the LIST come back, as opposed to anything else? This runs on
+        // every arrival, and the answer in the map is the same list until its
+        // own refresh lands.
+        let mut listed = false;
+        match self.fetch.get(&self.list_req()) {
+            Some(Got::Runs(runs)) => {
+                if arrived(&self.list_seen, &runs) {
+                    listed = true;
                     self.runs = runs.as_ref().clone();
                     let mut names: Vec<&str> =
                         self.runs.iter().filter_map(|r| r.name.as_deref()).collect();
                     names.sort_unstable();
                     names.dedup();
                     self.multi = names.len() > 1;
-                    self.error = None;
                     // Re-armed from what arrived rather than on a fixed
                     // timer: a list of finished runs schedules nothing.
+                    //
+                    // And only when the list ITSELF arrived. Done on every
+                    // arrival, the five-second jobs poll of a live run pushed
+                    // this deadline fifteen seconds out three times before it
+                    // could fall due, so the list was never asked again: the
+                    // run never showed as finished, and so its jobs were
+                    // polled for as long as the screen stayed open.
                     self.list_due = self
                         .runs
                         .iter()
                         .any(|r| !r.verdict().done())
-                        .then(|| Instant::now() + LIST_EVERY);
+                        .then(|| now + LIST_EVERY);
+                    self.list_seen = Some(runs);
+                    refreshed(&mut self.status);
                 }
-                Got::Failed(e) => self.error = Some(e),
-                _ => {}
+                self.error = None;
             }
+            Some(Got::Failed(e)) => {
+                self.error = Some(e);
+                refreshed(&mut self.status);
+            }
+            // Refused for want of a scope is an answer, and "no workflow runs
+            // here yet" is not what it says. Asking again every fifteen
+            // seconds would not change it either; `gh auth refresh` does.
+            Some(Got::Denied(d)) => {
+                self.error = Some(denied(&d));
+                self.list_due = None;
+                refreshed(&mut self.status);
+            }
+            _ => {}
         }
-        // Whatever the cursor is on drives the jobs clock, and its own arrival
-        // is what re-arms it -- so a run that finished between two polls stops
-        // being polled rather than being polled forever.
-        let live = self
-            .run(self.sel)
-            .map(|r| !r.verdict().done())
-            .unwrap_or(false);
-        self.jobs_due = live.then(|| Instant::now() + JOBS_EVERY);
+        // Whatever the cursor is on drives the jobs clock, and what arrived is
+        // what re-arms it: a live run whose jobs have all completed is not
+        // asked again.
+        //
+        // A list that has just arrived still calling the run live overrules
+        // that once. Jobs in a `needs:` chain do not exist until what they
+        // wait on has finished, so "every job has completed" can be true of a
+        // run with half its work ahead of it -- and the list is the only
+        // thing here that says which.
+        let live = self.run(self.sel).is_some_and(|r| !r.verdict().done());
+        self.jobs_due = (self.watching(self.sel) || (listed && live)).then(|| now + JOBS_EVERY);
         self.want_jobs(self.sel);
     }
 
@@ -358,39 +500,49 @@ impl Actions {
         }
     }
 
-    fn jobs_of(&self, run: &Run) -> Option<std::sync::Arc<Vec<crate::model::Job>>> {
-        match self.fetch.get(&self.jobs_req(run)) {
-            Some(Got::Jobs(j)) => Some(j),
-            _ => None,
-        }
+    fn jobs_of(&self, run: &Run) -> Maybe<Arc<Vec<Job>>> {
+        jobs_answer(self.fetch.get(&self.jobs_req(run)))
     }
 
-    fn log_of(&self, job: u64) -> Option<String> {
-        match self.fetch.get(&Req::Log { job }) {
-            Some(Got::Log(l)) => Some(l.as_ref().clone()),
-            _ => None,
+    fn log_of(&self, job: u64) -> Maybe<Arc<String>> {
+        log_answer(self.fetch.get(&Req::Log { job }))
+    }
+
+    /// Where `b` goes from here, or `None` when it has nowhere to go.
+    ///
+    /// Which two scopes `b` moves between depends on which question the
+    /// screen was opened to answer. Opened on a repo it is every branch or
+    /// the one checked out here; opened on a commit it is that commit or the
+    /// branch carrying it, because All would be a one-way door.
+    ///
+    /// Asked by the key AND by the footer that names its result. They were
+    /// two matches over the same three fields and had drifted: on a commit
+    /// with no branch the footer promised "just <sha>" for a key that widened
+    /// to every branch, and on a detached HEAD it promised "all branches" for
+    /// a key that did nothing.
+    fn next_scope(&self) -> Option<Scope> {
+        match (&self.scope, &self.branch, &self.commit) {
+            (Scope::Commit(_), Some(b), _) => Some(Scope::Branch(b.clone())),
+            (Scope::Commit(_), None, _) => Some(Scope::All),
+            (_, _, Some(sha)) => Some(Scope::Commit(sha.clone())),
+            (Scope::All, Some(b), None) => Some(Scope::Branch(b.clone())),
+            (Scope::Branch(_), _, None) => Some(Scope::All),
+            (Scope::All, None, None) => None,
         }
     }
 
     fn toggle_scope(&mut self) -> Flow {
-        // Which two scopes `b` moves between depends on which question the
-        // screen was opened to answer. Opened on a repo it is every branch or
-        // the one checked out here; opened on a commit it is that commit or
-        // the branch carrying it, because All would be a one-way door.
-        self.scope = match (&self.scope, &self.branch, &self.commit) {
-            (Scope::Commit(_), Some(b), _) => Scope::Branch(b.clone()),
-            (Scope::Commit(_), None, _) => Scope::All,
-            (_, _, Some(sha)) => Scope::Commit(sha.clone()),
-            (Scope::All, Some(b), None) => Scope::Branch(b.clone()),
-            (Scope::Branch(_), _, None) => Scope::All,
-            (Scope::All, None, None) => {
-                self.status = "no branch checked out here to scope to".into();
-                return Flow::Dirty;
-            }
+        let Some(next) = self.next_scope() else {
+            self.status = "no branch checked out here to scope to".into();
+            return Flow::Dirty;
         };
+        self.scope = next;
         // The runs on screen belong to the old scope. Clearing them is what
-        // stops the list showing one scope while its label claims another.
+        // stops the list showing one scope while its label claims another --
+        // and an error belongs to the scope that failed, likewise.
         self.runs.clear();
+        self.list_seen = None;
+        self.error = None;
         self.sel = 0;
         self.list_due = None;
         self.fetch.request(self.list_req());
@@ -403,7 +555,11 @@ impl Actions {
         // list timer and that refresh does bump the epoch, so it only showed
         // on a scope where everything had finished.
         self.sync();
-        Flow::Dirty
+        // Every row was replaced, so the cursor goes where this screen opens
+        // -- the newest run. `Dirty` left it at whatever row number it had
+        // been on in the OTHER scope, while `sel` here said 0: the pane, the
+        // jobs clock and the prefetch followed one run and the keys another.
+        Flow::Retarget
     }
 
     fn refresh(&mut self) -> Flow {
@@ -411,7 +567,7 @@ impl Actions {
         if let Some(run) = self.run(self.sel) {
             self.fetch.refresh(self.jobs_req(run));
         }
-        self.status = "refreshing\u{2026}".into();
+        self.status = REFRESHING.into();
         Flow::Dirty
     }
 
@@ -450,7 +606,11 @@ impl Actions {
             Confirm::Rerun => ("rerun ALL jobs of", "the whole workflow runs again"),
             Confirm::Cancel => ("cancel", "jobs still running will be stopped"),
         };
-        self.pending = Some(what);
+        self.pending = Some(Pending {
+            what,
+            id: run.id,
+            number: run.run_number,
+        });
         self.status = format!(
             "{verb} #{} \u{2014} {detail}.  y to confirm, any other key to leave it",
             run.run_number
@@ -458,42 +618,75 @@ impl Actions {
         Flow::Dirty
     }
 
-    fn act(&mut self, what: Confirm, sel: usize) -> Flow {
-        let Some(run) = self.run(sel) else {
-            return Flow::Continue;
-        };
-        let id = run.id.to_string();
-        let args: Vec<&str> = match what {
-            Confirm::RerunFailed => vec!["run", "rerun", &id, "--failed"],
-            Confirm::Rerun => vec!["run", "rerun", &id],
-            Confirm::Cancel => vec!["run", "cancel", &id],
-        };
-        let out = std::process::Command::new("gh").args(&args).output();
-        self.status = match out {
-            Ok(o) if o.status.success() => match what {
-                Confirm::Cancel => "cancel requested".into(),
-                _ => "rerun triggered".into(),
+    /// The command a confirm stands for, as the fetcher is asked to run it.
+    fn do_req(&self, asked: &Pending) -> Req {
+        Req::Do {
+            args: asked.argv(&self.repo),
+        }
+    }
+
+    /// Do what the prompt said, to the run the prompt NAMED.
+    ///
+    /// Nothing here reads the list or the cursor. Between the prompt and the
+    /// `y` a refresh can land and put a different run in the row.
+    ///
+    /// Sent, not waited for. `gh run rerun` is a network round trip, and run
+    /// here it froze the screen for all of it -- no redraw, no keys, and a
+    /// live run's clocks stopped. `hear_back` says how it went when it lands.
+    fn act(&mut self, asked: Pending) -> Flow {
+        self.fetch.send(self.do_req(&asked));
+        self.status = format!(
+            "asking github to {} #{}\u{2026}",
+            match asked.what {
+                Confirm::Cancel => "cancel",
+                Confirm::Rerun | Confirm::RerunFailed => "rerun",
             },
-            Ok(o) => String::from_utf8_lossy(&o.stderr)
-                .lines()
-                .find(|l| !l.trim().is_empty())
-                .unwrap_or("gh refused")
-                .trim()
-                .to_string(),
-            Err(e) => format!("could not run gh: {e}"),
-        };
-        // A rerun makes a NEW attempt of the same id, so the list has to be
-        // re-read before anything else is believed about this run. The jobs
-        // cache needs no eviction -- it is keyed by attempt, so the new
-        // attempt is simply a key nothing has answered yet.
-        self.fetch.refresh(self.list_req());
+            asked.number
+        );
+        self.sent.push(asked);
         Flow::Dirty
+    }
+
+    /// Say how each command that has come back went, and re-read the list
+    /// for it. Run from `sync`, so on every arrival.
+    fn hear_back(&mut self) {
+        for asked in std::mem::take(&mut self.sent) {
+            self.status = match self.fetch.get(&self.do_req(&asked)) {
+                Some(Got::Pending) | None => {
+                    self.sent.push(asked);
+                    continue;
+                }
+                Some(Got::Failed(e)) => e,
+                Some(Got::Denied(d)) => denied(&d),
+                Some(_) => match asked.what {
+                    Confirm::Cancel => format!("cancel requested for #{}", asked.number),
+                    _ => format!("rerun triggered for #{}", asked.number),
+                },
+            };
+            // A rerun makes a NEW attempt of the same id, so the list has to
+            // be re-read before anything else is believed about this run. The
+            // jobs cache needs no eviction -- it is keyed by attempt, so the
+            // new attempt is simply a key nothing has answered yet.
+            self.fetch.refresh(self.list_req());
+        }
     }
 
     /// Every completed job's log, concatenated, for the pager.
     fn whole_log(&mut self, sel: usize) -> Option<String> {
         let run = self.run(sel)?.clone();
-        let jobs = self.jobs_of(&run)?;
+        let jobs = match self.jobs_of(&run) {
+            Maybe::Got(jobs) => jobs,
+            // Said out loud: a key that does nothing reads as a key that is
+            // not bound.
+            Maybe::Waiting => {
+                self.status = "this run's jobs have not arrived yet".into();
+                return None;
+            }
+            Maybe::Cannot(why) => {
+                self.status = format!("could not list this run's jobs \u{2014} {why}");
+                return None;
+            }
+        };
         let reqs: Vec<Req> = jobs
             .iter()
             .filter(|j| j.has_log())
@@ -508,16 +701,20 @@ impl Actions {
         for job in jobs.iter().filter(|j| j.has_log()) {
             out.push_str(&format!(
                 "\n\u{2501}\u{2501}\u{2501} {} \u{2501}\u{2501}\u{2501}\n\n",
-                job.name
+                logs::plain(&job.name)
             ));
             match self.log_of(job.id) {
-                Some(log) => {
-                    for line in crate::logs::fmt_log(log.lines()) {
+                Maybe::Got(log) => {
+                    for line in logs::fmt_log(log.lines()) {
                         out.push_str(&line);
                         out.push('\n');
                     }
                 }
-                None => out.push_str("(log did not arrive)\n"),
+                Maybe::Waiting => out.push_str("(log did not arrive)\n"),
+                Maybe::Cannot(why) => out.push_str(&format!(
+                    "(could not fetch the log: {})\n",
+                    logs::plain(&why)
+                )),
             }
         }
         if !all {
@@ -564,17 +761,11 @@ impl Screen for Actions {
         // The jobs clock follows the cursor, because it is the SELECTED run
         // being watched -- moving to a finished run must stop the polling that
         // the live one started.
-        self.jobs_due = self
-            .run(sel)
-            .map(|r| !r.verdict().done())
-            .unwrap_or(false)
-            .then(|| Instant::now() + JOBS_EVERY);
+        self.jobs_due = self.watching(sel).then(|| Instant::now() + JOBS_EVERY);
     }
 
     fn tick(&mut self) -> Tick {
-        let now = self.fetch.epoch();
-        if now != self.epoch_seen {
-            self.epoch_seen = now;
+        if self.fetch.landed(&mut self.epoch_seen) {
             self.sync();
             return Tick::Changed;
         }
@@ -608,7 +799,7 @@ impl Screen for Actions {
 
     fn rows(&mut self) -> Vec<Row> {
         if let Some(e) = &self.error {
-            return vec![Row::leaf("could not list runs").detail(e.clone())];
+            return vec![Row::leaf("could not list runs").detail(logs::plain(e))];
         }
         if self.runs.is_empty() {
             let waiting = self.fetch.pending();
@@ -655,15 +846,18 @@ impl Screen for Actions {
                     }
                     _ => run.display_title.clone(),
                 };
+                // A title is a commit message or a pull request's, and a
+                // workflow's name is whatever its file says: text from
+                // outside, so characters only. See `logs::plain`.
                 let label = format!(
                     "{}{}",
                     if here { "\u{25cf} " } else { "  " },
-                    what.replace(['\t', '\n'], " ")
+                    logs::plain(&what)
                 );
                 let mut detail = time::age(run.age());
                 if across {
                     if let Some(br) = &run.head_branch {
-                        detail.push_str(&format!(" \u{b7} {br}"));
+                        detail.push_str(&format!(" \u{b7} {}", logs::plain(br)));
                     }
                 }
                 Row::leaf(label).detail(detail).badged(badge, color)
@@ -679,9 +873,7 @@ impl Screen for Actions {
             lines.push(format!(
                 "{DIM}`gh auth status` is the first thing to check.{OFF}"
             ));
-            return Pane { image: None, lines };
-        }
-        if let Some(run) = self.run(sel).cloned() {
+        } else if let Some(run) = self.run(sel).cloned() {
             lines.extend(render::run_header(&run, cols, self.multi));
             let jobs = self.jobs_of(&run);
             // The header is already drawn, so the body is told how much room
@@ -691,8 +883,14 @@ impl Screen for Actions {
             let room = rows.saturating_sub(lines.len() as u16);
             lines.extend(render::run_body(
                 &run,
-                jobs.as_deref().map(|v| v.as_slice()),
-                &|id| self.log_of(id),
+                jobs.view(|j| j.as_slice()),
+                // The body takes a log by value, so it is copied here and
+                // nowhere else.
+                &|id| match self.log_of(id) {
+                    Maybe::Got(log) => Maybe::Got(log.as_ref().clone()),
+                    Maybe::Waiting => Maybe::Waiting,
+                    Maybe::Cannot(why) => Maybe::Cannot(why),
+                },
                 cols,
                 room,
             ));
@@ -704,20 +902,28 @@ impl Screen for Actions {
             ));
             lines.push(format!("{DIM}it takes.{OFF}"));
         }
+        // Under the error as well as under a run. The error pane used to
+        // return before this, so what `r` and the keys said was never shown
+        // on the one screen where something had gone wrong.
         if !self.status.is_empty() {
             lines.push(String::new());
             lines.push(format!("{ORG}{}{OFF}", self.status));
         }
-        Pane { image: None, lines }
+        // The lines carry titles, names and gh's own words as well as this
+        // crate's colours, so they leave through the same gate a log does.
+        Pane {
+            image: None,
+            lines: lines.iter().map(|l| logs::clean(l)).collect(),
+        }
     }
 
     fn on_action(&mut self, action: Action, sel: usize) -> Flow {
         // A pending confirm consumes the very next key the screen sees,
         // whatever it is. `y` acts; everything else withdraws.
-        if let Some(what) = self.pending.take() {
+        if let Some(asked) = self.pending.take() {
             self.status.clear();
             return match action {
-                Action::Key('y') | Action::Key('Y') => self.act(what, sel),
+                Action::Key('y') | Action::Key('Y') => self.act(asked),
                 _ => {
                     self.status = "left alone".into();
                     Flow::Dirty
@@ -737,6 +943,7 @@ impl Screen for Actions {
                 Flow::Push(Box::new(Steps::open(
                     &self.repo,
                     run,
+                    self.list_req(),
                     self.multi,
                     Arc::clone(&self.fetch),
                 )))
@@ -751,13 +958,12 @@ impl Screen for Actions {
                 // Rerunning only the failures is both cheaper and what you
                 // nearly always mean, so it is what `e` offers when there ARE
                 // failures -- and the prompt says which it is about to do.
-                let failed = self
-                    .jobs_of(&run)
-                    .map(|j| {
-                        j.iter()
-                            .any(|j| j.verdict() == crate::model::Verdict::Failed)
-                    })
-                    .unwrap_or(false);
+                let failed = matches!(
+                    self.jobs_of(&run),
+                    Maybe::Got(jobs) if jobs
+                        .iter()
+                        .any(|j| j.verdict() == crate::model::Verdict::Failed)
+                );
                 let what = if failed {
                     Confirm::RerunFailed
                 } else {
@@ -795,20 +1001,27 @@ impl Screen for Actions {
         }
         // The footer names the RESULT, the way every toggle here does, so the
         // key does not have to be pressed to find out which way it goes.
-        let scope = match (&self.scope, &self.branch, &self.commit) {
-            (Scope::Commit(_), Some(b), _) => format!("b all of {b}"),
-            (_, _, Some(sha)) => format!("b just {}", short(sha)),
-            (Scope::All, Some(b), None) => format!("b just {b}"),
-            _ => "b all branches".into(),
+        //
+        // Read off where the key GOES, so the two cannot disagree, and left
+        // out when it goes nowhere: a key the footer offers and the screen
+        // refuses is worse than one not offered.
+        let scope = match (&self.scope, self.next_scope()) {
+            (_, None) => String::new(),
+            (_, Some(Scope::All)) => " \u{b7} b all branches".into(),
+            // Widening from a commit, as against narrowing from everything.
+            (Scope::Commit(_), Some(Scope::Branch(b))) => format!(" \u{b7} b all of {b}"),
+            (_, Some(Scope::Branch(b))) => format!(" \u{b7} b just {b}"),
+            (_, Some(Scope::Commit(sha))) => format!(" \u{b7} b just {}", short(&sha)),
         };
-        format!("enter jobs & steps \u{b7} o browser \u{b7} r refresh \u{b7} {scope}\ne rerun \u{b7} x cancel \u{b7} L whole log")
+        format!("enter jobs & steps \u{b7} o browser \u{b7} r refresh{scope}\ne rerun \u{b7} x cancel \u{b7} L whole log")
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::RunList;
+    use crate::menu::check;
+    use crate::model::{JobList, RunList};
 
     fn runs(states: &[(&str, Option<&str>)]) -> Vec<Run> {
         let items: Vec<String> = states
@@ -830,6 +1043,47 @@ mod tests {
             .workflow_runs
     }
 
+    fn asked(what: Confirm, id: u64) -> Pending {
+        Pending {
+            what,
+            id,
+            number: id,
+        }
+    }
+
+    fn jobs(states: &[&str]) -> Got {
+        let items: Vec<String> = states
+            .iter()
+            .enumerate()
+            .map(|(i, status)| {
+                let c = if *status == "completed" {
+                    r#","conclusion":"success""#
+                } else {
+                    ""
+                };
+                format!(r#"{{"id":{i},"name":"j{i}","status":"{status}"{c},"steps":[]}}"#)
+            })
+            .collect();
+        Got::Jobs(Arc::new(
+            serde_json::from_str::<JobList>(&format!(r#"{{"jobs":[{}]}}"#, items.join(",")))
+                .expect("parses")
+                .jobs,
+        ))
+    }
+
+    /// Run 0's jobs as the fetcher keys them, whatever state the run is in.
+    fn jobs_key() -> Req {
+        Req::Jobs {
+            run: 0,
+            attempt: 1,
+            persist: false,
+        }
+    }
+
+    fn text(pane: Pane) -> String {
+        pane.lines.join("\n")
+    }
+
     /// Built without touching the network: these tests are about the clocks,
     /// and a screen that needed the API to be examined would not be testable.
     fn screen(states: &[(&str, Option<&str>)]) -> Actions {
@@ -842,6 +1096,7 @@ mod tests {
             head_sha: Some("sha0".into()),
             commit: None,
             runs,
+            list_seen: None,
             multi: false,
             error: None,
             status: String::new(),
@@ -850,6 +1105,7 @@ mod tests {
             jobs_due: None,
             sel: 0,
             pending: None,
+            sent: Vec::new(),
         };
         // What `sync` does with what arrived, minus the arriving.
         me.list_due = me
@@ -916,11 +1172,11 @@ mod tests {
     #[test]
     fn a_confirm_is_withdrawn_by_anything_that_is_not_yes() {
         let mut s = screen(&[("in_progress", None)]);
-        s.pending = Some(Confirm::Cancel);
+        s.pending = Some(asked(Confirm::Cancel, 0));
         s.on_action(Action::Key('j'), 0);
         assert!(s.pending.is_none(), "a stray key left the prompt up");
 
-        s.pending = Some(Confirm::Cancel);
+        s.pending = Some(asked(Confirm::Cancel, 0));
         s.focus(1);
         assert!(s.pending.is_none(), "moving the cursor left the prompt up");
     }
@@ -945,10 +1201,16 @@ mod tests {
             ("completed", Some("failure")),
         ]);
         assert_eq!(s.runs.len(), 2);
-        s.on_action(Action::Key('b'), 0);
+        s.sel = 1;
+        let flow = s.on_action(Action::Key('b'), 1);
         assert!(matches!(s.scope, Scope::Branch(_)));
         assert!(s.runs.is_empty(), "showed the old scope's runs");
         assert_eq!(s.sel, 0);
+        // And the cursor is sent where `sel` now says it is. Answering
+        // `Dirty` left it on row 1 of a list this screen was reading from
+        // row 0.
+        assert!(matches!(flow, Flow::Retarget), "left the cursor behind");
+        assert_eq!(s.initial_sel(), 0);
     }
 
     /// A screen the pull request menu opened must be able to get BACK. Its
@@ -1091,6 +1353,292 @@ mod tests {
         assert!(rows[1].label.starts_with("  "), "{:?}", rows[1].label);
     }
 
+    /// The rule, over every command this screen can run: it names its
+    /// repository. `github` is launched from anywhere, and a `gh run` left to
+    /// work out the repository from the working directory fails outside a
+    /// clone and reaches the WRONG repository inside a different one.
+    #[test]
+    fn no_command_depends_on_the_working_directory() {
+        for what in [Confirm::Rerun, Confirm::RerunFailed, Confirm::Cancel] {
+            let argv = asked(what, 4242).argv("roest1/dotfiles");
+            assert!(
+                check::names_repo(&argv, "roest1/dotfiles"),
+                "{what:?} names no repository: {argv:?}"
+            );
+            assert_eq!(
+                &argv[..3],
+                [
+                    "run",
+                    if what == Confirm::Cancel {
+                        "cancel"
+                    } else {
+                        "rerun"
+                    },
+                    "4242"
+                ]
+            );
+            assert_eq!(
+                argv.iter().any(|a| a == "--failed"),
+                what == Confirm::RerunFailed
+            );
+        }
+    }
+
+    /// `rows()` and `run()` are two readings of one list, in every shape the
+    /// list takes. The error shape is the one that was wrong: one row saying
+    /// the list could not be read, drawn over runs still held underneath.
+    #[test]
+    fn the_row_walk_agrees_with_the_rows_in_every_shape() {
+        let mut s = screen(&[("in_progress", None), ("completed", Some("failure"))]);
+        let rows = s.rows();
+        assert_eq!(rows.len(), 2);
+        for (i, row) in rows.iter().enumerate() {
+            let run = s.run(i).expect("a run behind every row");
+            assert!(row.label.contains(&run.display_title), "row {i}: {row:?}");
+        }
+        assert!(s.run(2).is_none());
+
+        // The list could not be refreshed. One row, and nothing behind it.
+        s.error = Some("gh: Bad credentials (HTTP 401)".into());
+        let rows = s.rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].label, "could not list runs");
+        assert!(
+            s.run(0).is_none(),
+            "a run is reachable behind the error row"
+        );
+
+        // Nothing has run here. One row, and nothing behind it.
+        let mut empty = screen(&[]);
+        assert_eq!(empty.rows().len(), 1);
+        assert!(empty.run(0).is_none());
+    }
+
+    /// With the error row up, no key acts on a run: there is not one on
+    /// screen. `e` then `y` used to rerun the first run of the list from
+    /// before the failure, with the prompt itself never drawn.
+    #[test]
+    fn no_key_acts_on_a_run_hidden_behind_the_error_row() {
+        let mut s = screen(&[("in_progress", None), ("completed", Some("failure"))]);
+        s.error = Some("gh: Bad credentials (HTTP 401)".into());
+        for key in ['e', 'x', 'o', 'L'] {
+            s.on_action(Action::Key(key), 0);
+            assert!(s.pending.is_none(), "{key} armed a confirm on a hidden run");
+        }
+        assert!(matches!(s.on_action(Action::Activate, 0), Flow::Continue));
+        assert!(!s.watching(0), "still polling the jobs of a hidden run");
+
+        // And whatever the screen has to say is said under the error too.
+        s.status = "left alone".into();
+        let pane = text(s.pane(0, 60, 40));
+        assert!(pane.contains("Bad credentials"), "{pane}");
+        assert!(
+            pane.contains("left alone"),
+            "the error pane hid the status: {pane}"
+        );
+    }
+
+    /// The prompt names a run, and `y` acts on THAT run -- by id, wherever it
+    /// is in the list by then. A refresh landing between the two keys used to
+    /// hand the confirm to whatever had moved into the row.
+    #[test]
+    fn a_confirm_acts_on_the_run_it_named() {
+        let mut s = screen(&[("in_progress", None), ("in_progress", None)]);
+        s.on_action(Action::Key('x'), 1);
+        assert!(s.status.contains("cancel #1"), "{}", s.status);
+        // A push lands: a new run takes row 0 and everything moves down one.
+        let mut newer = runs(&[("queued", None)]);
+        newer[0].id = 99;
+        newer[0].run_number = 99;
+        newer.extend(s.runs.clone());
+        s.runs = newer;
+        assert_eq!(s.runs[1].id, 0, "row 1 is a different run now");
+
+        let asked = s.pending.expect("still asking");
+        assert_eq!(
+            (asked.what, asked.id, asked.number),
+            (Confirm::Cancel, 1, 1)
+        );
+        assert_eq!(
+            asked.argv(&s.repo),
+            ["run", "cancel", "1", "--repo", "roest1/dotfiles"]
+        );
+    }
+
+    /// The list clock is re-armed by the LIST arriving, and by nothing else.
+    /// Re-armed on every arrival, a live run's five-second jobs poll pushed
+    /// the fifteen-second list deadline out each time it landed: the list was
+    /// never re-asked, the run never showed as finished, and its jobs were
+    /// polled for good.
+    #[test]
+    fn only_the_list_arriving_rearms_the_list_clock() {
+        let mut s = screen(&[("in_progress", None)]);
+        let list = |s: &Actions| Got::Runs(Arc::new(s.runs.clone()));
+        s.fetch.seed(s.list_req(), list(&s));
+        s.fetch.seed(jobs_key(), jobs(&["in_progress"]));
+        s.sync();
+        let armed = s.list_due.expect("a live run arms the list clock");
+
+        // The jobs poll lands, and lands again. The list has not.
+        for _ in 0..3 {
+            std::thread::sleep(Duration::from_millis(2));
+            s.fetch.seed(jobs_key(), jobs(&["in_progress"]));
+            s.sync();
+            assert_eq!(
+                s.list_due,
+                Some(armed),
+                "a jobs arrival moved the list clock"
+            );
+            assert!(s.jobs_due.is_some(), "stopped watching jobs still going");
+        }
+
+        // Every job has completed, so asking for them again is asking for
+        // the same thing: the jobs clock stops, though the list still calls
+        // the run live.
+        s.fetch.seed(jobs_key(), jobs(&["completed", "completed"]));
+        s.sync();
+        assert!(
+            s.jobs_due.is_none(),
+            "still polling jobs that have all finished"
+        );
+        assert_eq!(s.list_due, Some(armed));
+        s.focus(0);
+        assert!(s.jobs_due.is_none(), "the cursor restarted it");
+
+        // The list arrives, and that does move its clock. It still says the
+        // run is going -- later jobs of a `needs:` chain do not exist until
+        // the earlier ones finish -- so the jobs are looked at once more.
+        std::thread::sleep(Duration::from_millis(2));
+        s.fetch.seed(s.list_req(), list(&s));
+        s.sync();
+        assert!(
+            s.list_due.is_some_and(|d| d > armed),
+            "the list did not re-arm"
+        );
+        assert!(s.jobs_due.is_some(), "gave up on a run the list calls live");
+    }
+
+    /// A list refused for want of a scope is an answer, and it is not "no
+    /// workflow runs here yet". It used to be dropped on the floor.
+    #[test]
+    fn a_refused_list_is_said_to_be_refused() {
+        let mut s = screen(&[]);
+        s.list_due = Some(Instant::now());
+        s.fetch.seed(
+            s.list_req(),
+            Got::Denied(Denied {
+                accepted: vec!["repo".into()],
+                suggest: "repo".into(),
+            }),
+        );
+        s.sync();
+        let rows = s.rows();
+        assert_eq!(rows[0].label, "could not list runs");
+        let why = rows[0].detail.clone().unwrap_or_default();
+        assert!(
+            why.contains("gh auth refresh -h github.com -s repo"),
+            "{why}"
+        );
+        // Asking again on a timer will not grant a scope.
+        assert!(s.list_due.is_none());
+    }
+
+    /// And the same one level in: jobs that could not be fetched are not
+    /// jobs still being fetched.
+    #[test]
+    fn jobs_that_failed_to_arrive_are_not_shown_as_on_their_way() {
+        let mut s = screen(&[("in_progress", None)]);
+        s.fetch.seed(
+            jobs_key(),
+            Got::Failed("gh: Server Error (HTTP 502)".into()),
+        );
+        let pane = text(s.pane(0, 60, 40));
+        assert!(!pane.contains("fetching jobs"), "{pane}");
+        assert!(pane.contains("could not list this run's jobs"), "{pane}");
+        assert!(pane.contains("HTTP 502"), "{pane}");
+    }
+
+    /// `r` says "refreshing", and the answer landing is what un-says it. The
+    /// line used to stay up until the next key.
+    #[test]
+    fn the_refreshing_line_comes_down_when_the_list_lands() {
+        let mut s = screen(&[]);
+        s.status = REFRESHING.into();
+        s.fetch.seed(s.list_req(), Got::Runs(Arc::new(Vec::new())));
+        s.sync();
+        assert!(s.status.is_empty(), "{}", s.status);
+    }
+
+    /// A request in flight keeps the screen awake on the short clock, with
+    /// no slow clock running: an idle tick here is a refresh that is drawn
+    /// on the next keypress.
+    #[test]
+    fn a_request_in_flight_is_not_an_idle_screen() {
+        let mut s = screen(&[]);
+        assert!(matches!(s.tick(), Tick::Idle));
+        // `gh` refuses the flag without going anywhere.
+        s.fetch.refresh(Req::Cmd {
+            args: vec!["--definitely-not-a-gh-flag".into()],
+        });
+        match s.tick() {
+            Tick::Wake(d) => assert_eq!(d, IN_FLIGHT),
+            // It has already come back, which is the other honest answer.
+            Tick::Changed => {}
+            _ => panic!("went idle with a request in flight"),
+        }
+    }
+
+    /// The footer names where `b` GOES, read off the same function the key
+    /// uses. On a commit with no branch it said "just <sha>" for a key that
+    /// widens to every branch; on a detached HEAD it offered "all branches"
+    /// for a key that does nothing.
+    #[test]
+    fn the_footer_offers_b_only_where_b_goes() {
+        let mut s = screen(&[("completed", Some("success"))]);
+        s.scope = Scope::Commit("sha0".into());
+        s.commit = Some("sha0".into());
+        s.branch = None;
+        assert_eq!(s.next_scope(), Some(Scope::All));
+        assert!(s.footer().contains("b all branches"), "{}", s.footer());
+        assert!(!s.footer().contains("b just"), "{}", s.footer());
+
+        s.scope = Scope::All;
+        s.commit = None;
+        assert_eq!(s.next_scope(), None);
+        assert!(!s.footer().contains(" b "), "{}", s.footer());
+        assert!(s.footer().contains("r refresh"), "{}", s.footer());
+
+        s.branch = Some("main".into());
+        assert!(s.footer().contains("b just main"), "{}", s.footer());
+        s.scope = Scope::Branch("main".into());
+        assert!(s.footer().contains("b all branches"), "{}", s.footer());
+    }
+
+    /// A title is a commit message. Whatever is in one, the row holds
+    /// characters and the pane holds characters and colours.
+    #[test]
+    fn a_title_cannot_carry_an_escape_to_the_terminal() {
+        let mut s = screen(&[("completed", Some("success"))]);
+        s.runs[0].display_title = "fix\u{1b}]52;c;QQ==\u{7}\u{1b}[2J it\tnow".into();
+        s.runs[0].head_branch = Some("feat\u{1b}[Hx".into());
+        s.fetch.seed(
+            Req::Jobs {
+                run: 0,
+                attempt: 1,
+                persist: true,
+            },
+            jobs(&["completed"]),
+        );
+        let rows = s.rows();
+        assert!(rows[0].label.ends_with("fix it now"), "{:?}", rows[0].label);
+        let detail = rows[0].detail.clone().unwrap_or_default();
+        assert!(!detail.chars().any(char::is_control), "{detail:?}");
+        for line in s.pane(0, 60, 40).lines {
+            assert!(!line.contains("52;c") && !line.contains("[2J"), "{line:?}");
+            assert!(!line.contains("[H"), "{line:?}");
+        }
+    }
+
     #[test]
     fn a_branch_scope_encodes_the_characters_a_branch_name_may_hold() {
         // `/` and `+` both change the meaning of a query parameter, and both
@@ -1122,5 +1670,69 @@ mod tests {
         );
         // A sha shorter than seven characters must not panic the slice.
         assert_eq!(Scope::Commit("abc".into()).label(), "commit abc");
+    }
+
+    /// `y` sends the command and comes straight back. It used to run gh
+    /// there and then, on the thread that draws, and the screen stood still
+    /// for the round trip. The command is the one the prompt named, and
+    /// nothing is said to have happened until GitHub has said so.
+    #[test]
+    fn a_confirmed_rerun_is_sent_and_not_waited_for() {
+        let mut s = screen(&[("completed", Some("failure")), ("in_progress", None)]);
+        s.on_action(Action::Key('e'), 0);
+        let asked = s.pending.expect("e asks first");
+        let sent = Req::Do {
+            args: asked.argv(&s.repo),
+        };
+        assert!(s.fetch.get(&sent).is_none(), "sent before the `y`");
+
+        assert!(matches!(s.on_action(Action::Key('y'), 0), Flow::Dirty));
+        assert!(s.fetch.flying(&sent), "y sent nothing");
+        assert!(
+            s.status.contains("asking github to rerun #0"),
+            "{}",
+            s.status
+        );
+        assert!(matches!(s.tick(), Tick::Wake(d) if d == IN_FLIGHT));
+        // Something else lands first. That is not the answer.
+        s.sync();
+        assert!(s.status.contains("asking github"), "{}", s.status);
+        assert!(!s.fetch.flying(&s.list_req()), "re-read before it was done");
+
+        s.fetch
+            .seed(sent, Got::Json(Arc::new(serde_json::Value::Null)));
+        s.sync();
+        assert_eq!(s.status, "rerun triggered for #0");
+        // A rerun is a new attempt, so the list is read again.
+        assert!(s.fetch.flying(&s.list_req()));
+        assert!(s.sent.is_empty(), "reported once, not on every arrival");
+    }
+
+    /// A cancel that GitHub refused says so in gh's own words, and any key
+    /// but `y` still sends nothing at all.
+    #[test]
+    fn a_refused_cancel_says_why_and_a_withdrawn_one_is_never_sent() {
+        let mut s = screen(&[("in_progress", None)]);
+        s.on_action(Action::Key('x'), 0);
+        let sent = Req::Do {
+            args: s.pending.expect("x asks first").argv(&s.repo),
+        };
+        s.on_action(Action::Key('n'), 0);
+        assert!(s.fetch.get(&sent).is_none(), "a key that is not y sent it");
+        assert!(s.sent.is_empty());
+
+        s.on_action(Action::Key('x'), 0);
+        s.on_action(Action::Key('y'), 0);
+        assert!(s.fetch.flying(&sent));
+        s.fetch.seed(
+            sent,
+            Got::Failed("gh: Cannot cancel a workflow run that is completed".into()),
+        );
+        s.sync();
+        assert!(s.status.contains("Cannot cancel"), "{}", s.status);
+        assert!(
+            s.fetch.flying(&s.list_req()),
+            "the list is read again either way"
+        );
     }
 }

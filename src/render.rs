@@ -8,12 +8,20 @@
 //!
 //! Everything returns `Vec<String>` with ANSI already in it, because that is
 //! what `Pane` takes and because a log line the tool coloured itself has to
-//! pass through untouched.
+//! keep its colours.
 
+use crate::gh::Maybe;
 use crate::logs;
 use crate::model::{Job, Run, Step, Verdict};
 use crate::paint::{rule, BOLD, DIM, GRY, OFF, ORG, PUR, RED};
 use crate::time;
+
+/// The line a step gets in place of a log its job cannot have yet.
+///
+/// GitHub serves a job's log once the job has COMPLETED, so for a step that
+/// has finished inside a job still going, nothing has been asked for and
+/// nothing is on its way. Saying "fetching" there was a wait with no end.
+const LOG_LATER: &str = "the log lands when the job completes";
 
 /// The most log lines to inline under one failed step, however much room there
 /// is.
@@ -59,8 +67,13 @@ fn tail_budget(rows: u16, skeleton: usize, failed: usize) -> usize {
 /// The dots are not decoration: a duration right-aligned after a
 /// variable-length job name is unreadable as a column, and a run of spaces
 /// loses the eye on a wide pane. Same device the fzf body used.
+///
+/// The name is reduced to its characters BEFORE it is measured. Every name
+/// in these bodies is: they come from a workflow file or a commit, and one
+/// carrying an escape sequence would otherwise be cut and padded by a count
+/// that included characters the terminal never draws.
 fn dotted(name: &str, width: usize) -> String {
-    let n: String = truncate(name, width.saturating_sub(2));
+    let n: String = truncate(&logs::plain(name), width.saturating_sub(2));
     let pad = width.saturating_sub(n.chars().count());
     if pad > 1 {
         format!("{n} {}", "\u{b7}".repeat(pad - 1))
@@ -95,7 +108,7 @@ pub fn run_header(run: &Run, cols: u16, show_workflow: bool) -> Vec<String> {
     let mut top = String::new();
     if show_workflow {
         if let Some(name) = &run.name {
-            top.push_str(&format!("{BOLD}{PUR}{name}{OFF} "));
+            top.push_str(&format!("{BOLD}{PUR}{}{OFF} ", logs::plain(name)));
         }
     }
     top.push_str(&format!("{DIM}#{}{OFF}", run.run_number));
@@ -103,14 +116,17 @@ pub fn run_header(run: &Run, cols: u16, show_workflow: bool) -> Vec<String> {
         top.push_str(&format!(" {DIM}(attempt {}){OFF}", run.run_attempt));
     }
     if let Some(br) = &run.head_branch {
-        top.push_str(&format!("  {ORG}{br}{OFF}"));
+        top.push_str(&format!("  {ORG}{}{OFF}", logs::plain(br)));
     }
     out.push(top);
-    out.push(format!("{BOLD}{}{OFF}", truncate(&run.display_title, w)));
+    out.push(format!(
+        "{BOLD}{}{OFF}",
+        truncate(&logs::plain(&run.display_title), w)
+    ));
     out.push(format!(
         "{GRY}{} \u{b7} {} \u{b7} {} ago{OFF}",
-        run.event.replace('_', " "),
-        run.actor_login(),
+        logs::plain(&run.event).replace('_', " "),
+        logs::plain(run.actor_login()),
         time::age(run.age())
     ));
     out.push(rule(cols));
@@ -163,13 +179,22 @@ fn summary(jobs: &[Job]) -> String {
 
 /// A failed step's log tail, indented under its line.
 ///
-/// `log` is `None` while the fetch is in flight, and that is a different thing
-/// from a step with no output -- saying so is the difference between "wait a
-/// moment" and "there is nothing here".
-fn step_tail(log: Option<&str>, step: &Step, name_hint: &str, tail: usize) -> Vec<String> {
+/// `log` is `Waiting` while the fetch is in flight, and that is a different
+/// thing from a step with no output -- saying so is the difference between
+/// "wait a moment" and "there is nothing here". A fetch that failed is a third
+/// thing again, and gets the reason it failed.
+fn step_tail(log: &Maybe<&str>, step: &Step, name_hint: &str, tail: usize) -> Vec<String> {
     let bar = format!("     {RED}\u{2503}{OFF} ");
-    let Some(log) = log else {
-        return vec![format!("     {DIM}\u{2503} fetching the log\u{2026}{OFF}")];
+    let log = match log {
+        Maybe::Got(log) => *log,
+        Maybe::Waiting => {
+            return vec![format!("     {DIM}\u{2503} fetching the log\u{2026}{OFF}")];
+        }
+        Maybe::Cannot(why) => {
+            return vec![format!(
+                "     {RED}\u{2503} could not fetch the log{OFF} {DIM}\u{2014} {why}{OFF}"
+            )];
+        }
     };
     let slice = logs::step_slice(
         log,
@@ -213,7 +238,7 @@ fn step_tail(log: Option<&str>, step: &Step, name_hint: &str, tail: usize) -> Ve
 /// green steps are twelve lines saying the same thing as its own line, and on a
 /// matrix build they push the failure off the pane -- which is the one thing
 /// this body exists to show.
-fn job_block(job: &Job, log: Option<&str>, width: usize, tail: usize) -> Vec<String> {
+fn job_block(job: &Job, log: &Maybe<&str>, width: usize, tail: usize) -> Vec<String> {
     let v = job.verdict();
     let mut out = Vec::new();
     let emphasis = match v {
@@ -249,7 +274,11 @@ fn job_block(job: &Job, log: Option<&str>, width: usize, tail: usize) -> Vec<Str
             right(&step.elapsed().map(time::dur).unwrap_or_default(), 6)
         ));
         if sv == Verdict::Failed && step.started_at.is_some() {
-            out.extend(step_tail(log, step, &step.name, tail));
+            if job.has_log() {
+                out.extend(step_tail(log, step, &step.name, tail));
+            } else {
+                out.push(format!("     {DIM}\u{2503} {LOG_LATER}{OFF}"));
+            }
         }
     }
     out
@@ -257,20 +286,29 @@ fn job_block(job: &Job, log: Option<&str>, width: usize, tail: usize) -> Vec<Str
 
 /// A run's whole body: status, every job, the failures opened up, and a tally.
 ///
-/// `jobs` is `None` until the fetch lands. The header is already on screen by
-/// then, so this is the only part that has to say it is waiting.
+/// `jobs` is `Waiting` until the fetch lands. The header is already on screen
+/// by then, so this is the only part that has to say it is waiting -- or,
+/// when the fetch came back refused or broken, that it is not.
 pub fn run_body(
     run: &Run,
-    jobs: Option<&[Job]>,
-    log_for: &dyn Fn(u64) -> Option<String>,
+    jobs: Maybe<&[Job]>,
+    log_for: &dyn Fn(u64) -> Maybe<String>,
     cols: u16,
     rows: u16,
 ) -> Vec<String> {
     let width = (cols as usize).clamp(24, 96);
     let mut out = vec![status_line(run), String::new()];
-    let Some(jobs) = jobs else {
-        out.push(format!("{DIM}fetching jobs\u{2026}{OFF}"));
-        return out;
+    let jobs = match jobs {
+        Maybe::Got(jobs) => jobs,
+        Maybe::Waiting => {
+            out.push(format!("{DIM}fetching jobs\u{2026}{OFF}"));
+            return out;
+        }
+        Maybe::Cannot(why) => {
+            out.push(format!("{RED}could not list this run's jobs{OFF}"));
+            out.push(format!("{DIM}{why}{OFF}"));
+            return out;
+        }
     };
     // Measured before anything is rendered, because the budget each failed step
     // gets depends on how much room the STRUCTURE needs -- and the structure is
@@ -280,9 +318,9 @@ pub fn run_body(
         let log = if job.verdict() == Verdict::Failed && job.has_log() {
             log_for(job.id)
         } else {
-            None
+            Maybe::Waiting
         };
-        out.extend(job_block(job, log.as_deref(), width, tail));
+        out.extend(job_block(job, &log.view(String::as_str), width, tail));
     }
     out.push(String::new());
     out.push(summary(jobs));
@@ -321,11 +359,11 @@ fn expands(v: Verdict) -> bool {
 /// The word for a job's or step's current state: its conclusion once it has
 /// one, its status while it does not, underscores spelled out.
 fn state_word(status: Option<&str>, conclusion: Option<&str>) -> String {
-    conclusion.or(status).unwrap_or("unknown").replace('_', " ")
+    logs::plain(conclusion.or(status).unwrap_or("unknown")).replace('_', " ")
 }
 
 /// One job, with every failed step's log in full rather than tailed.
-pub fn job_body(job: &Job, log: Option<&str>, cols: u16, rows: u16) -> Vec<String> {
+pub fn job_body(job: &Job, log: Maybe<&str>, cols: u16, rows: u16) -> Vec<String> {
     let width = (cols as usize).clamp(24, 96);
     let v = job.verdict();
     let mut detail = state_word(job.status.as_deref(), job.conclusion.as_deref());
@@ -336,10 +374,14 @@ pub fn job_body(job: &Job, log: Option<&str>, cols: u16, rows: u16) -> Vec<Strin
         }
     }
     if let Some(runner) = &job.runner_name {
-        detail.push_str(&format!(" \u{b7} {runner}"));
+        detail.push_str(&format!(" \u{b7} {}", logs::plain(runner)));
     }
     let mut out = vec![
-        format!("{} {BOLD}{}{OFF}", v.glyph(), truncate(&job.name, width)),
+        format!(
+            "{} {BOLD}{}{OFF}",
+            v.glyph(),
+            truncate(&logs::plain(&job.name), width)
+        ),
         format!("{}{detail}{OFF}", v.color()),
         rule(cols),
     ];
@@ -351,7 +393,7 @@ pub fn job_body(job: &Job, log: Option<&str>, cols: u16, rows: u16) -> Vec<Strin
     // simply leaves more room per failed step than asking a whole run did.
     let one = std::slice::from_ref(job);
     let tail = tail_budget(rows, skeleton_lines(one), failed_steps(one));
-    let mut body = job_block(job, log, width, tail);
+    let mut body = job_block(job, &log, width, tail);
     if !body.is_empty() {
         body.remove(0);
     }
@@ -360,12 +402,13 @@ pub fn job_body(job: &Job, log: Option<&str>, cols: u16, rows: u16) -> Vec<Strin
 }
 
 /// One step: where it sits, what it did, and its whole log.
-pub fn step_body(job: &Job, step: &Step, log: Option<&str>, cols: u16, rows: u16) -> Vec<String> {
+pub fn step_body(job: &Job, step: &Step, log: Maybe<&str>, cols: u16, rows: u16) -> Vec<String> {
     let v = step.verdict();
     let mut out = vec![
         format!(
             "{GRY}{}{OFF} {DIM}\u{203a}{OFF} {BOLD}{}{OFF}",
-            job.name, step.name
+            logs::plain(&job.name),
+            logs::plain(&step.name)
         ),
         format!(
             "{} {}{}{OFF}{DIM}{}{OFF}",
@@ -381,13 +424,19 @@ pub fn step_body(job: &Job, step: &Step, log: Option<&str>, cols: u16, rows: u16
     match v {
         Verdict::Skipped => out.push(format!("{DIM}skipped{OFF}")),
         Verdict::Running | Verdict::Queued => out.push(format!(
-            "{} {}\u{2014} the log lands when the job completes{OFF}",
+            "{} {}\u{2014} {LOG_LATER}{OFF}",
             v.glyph(),
             v.color()
         )),
+        // The step is done and its job is not, so there is no log to have.
+        _ if !job.has_log() => out.push(format!("{DIM}{LOG_LATER}{OFF}")),
         _ => match log {
-            None => out.push(format!("{DIM}fetching the log\u{2026}{OFF}")),
-            Some(log) => {
+            Maybe::Waiting => out.push(format!("{DIM}fetching the log\u{2026}{OFF}")),
+            Maybe::Cannot(why) => {
+                out.push(format!("{RED}could not fetch the log{OFF}"));
+                out.push(format!("{DIM}{why}{OFF}"));
+            }
+            Maybe::Got(log) => {
                 let slice = logs::step_slice(
                     log,
                     step.started_at.as_deref().unwrap_or(""),
@@ -458,21 +507,7 @@ mod tests {
     }
 
     fn plain(lines: &[String]) -> String {
-        let joined = lines.join("\n");
-        let mut out = String::new();
-        let mut chars = joined.chars();
-        while let Some(c) = chars.next() {
-            if c == '\x1b' {
-                for c in chars.by_ref() {
-                    if c == 'm' {
-                        break;
-                    }
-                }
-            } else {
-                out.push(c);
-            }
-        }
-        out
+        crate::paint::unstyled(&lines.join("\n"))
     }
 
     /// The header is built from the LIST alone, so it must be complete before
@@ -502,7 +537,7 @@ mod tests {
     #[test]
     fn a_body_with_nothing_fetched_says_it_is_fetching() {
         let r = run("in_progress", None);
-        let text = plain(&run_body(&r, None, &|_| None, 60, 40));
+        let text = plain(&run_body(&r, Maybe::Waiting, &|_| Maybe::Waiting, 60, 40));
         assert!(text.contains("in progress"));
         assert!(text.contains("so far"), "{text}");
         assert!(text.contains("fetching jobs"));
@@ -514,8 +549,8 @@ mod tests {
     fn only_the_failing_job_opens_its_steps() {
         let text = plain(&run_body(
             &run("completed", Some("failure")),
-            Some(&jobs()),
-            &|_| None,
+            Maybe::Got(&jobs()),
+            &|_| Maybe::Waiting,
             60,
             40,
         ));
@@ -531,16 +566,16 @@ mod tests {
     fn a_missing_log_reads_differently_from_an_empty_one() {
         let waiting = plain(&run_body(
             &run("completed", Some("failure")),
-            Some(&jobs()),
-            &|_| None,
+            Maybe::Got(&jobs()),
+            &|_| Maybe::Waiting,
             60,
             40,
         ));
         assert!(waiting.contains("fetching the log"));
         let empty = plain(&run_body(
             &run("completed", Some("failure")),
-            Some(&jobs()),
-            &|_| Some(String::new()),
+            Maybe::Got(&jobs()),
+            &|_| Maybe::Got(String::new()),
             60,
             40,
         ));
@@ -560,8 +595,8 @@ mod tests {
         }
         let text = plain(&run_body(
             &run("completed", Some("failure")),
-            Some(&jobs()),
-            &|_| Some(log.clone()),
+            Maybe::Got(&jobs()),
+            &|_| Maybe::Got(log.clone()),
             60,
             40,
         ));
@@ -591,8 +626,8 @@ mod tests {
         for rows in [12u16, 20, 30, 46, 80] {
             let body = run_body(
                 &run("completed", Some("failure")),
-                Some(&jobs()),
-                &|_| Some(long_log()),
+                Maybe::Got(&jobs()),
+                &|_| Maybe::Got(long_log()),
                 60,
                 rows,
             );
@@ -610,8 +645,8 @@ mod tests {
     fn the_summary_and_the_step_names_survive_a_small_pane() {
         let text = plain(&run_body(
             &run("completed", Some("failure")),
-            Some(&jobs()),
-            &|_| Some(long_log()),
+            Maybe::Got(&jobs()),
+            &|_| Maybe::Got(long_log()),
             60,
             14,
         ));
@@ -626,8 +661,8 @@ mod tests {
         // instead of showing two lines of a four-hundred-line log.
         let tiny = plain(&run_body(
             &run("completed", Some("failure")),
-            Some(&jobs()),
-            &|_| Some(long_log()),
+            Maybe::Got(&jobs()),
+            &|_| Maybe::Got(long_log()),
             60,
             9,
         ));
@@ -640,7 +675,7 @@ mod tests {
     #[test]
     fn a_step_body_tails_rather_than_overflowing() {
         let js = jobs();
-        let body = step_body(&js[1], &js[1].steps[0], Some(&long_log()), 60, 24);
+        let body = step_body(&js[1], &js[1].steps[0], Maybe::Got(&long_log()), 60, 24);
         assert!(body.len() <= 24, "{} lines in a 24-row pane", body.len());
         assert!(plain(&body).contains("L pages the whole log"));
     }
@@ -649,8 +684,8 @@ mod tests {
     fn a_run_with_no_jobs_yet_says_what_it_is_waiting_for() {
         let text = plain(&run_body(
             &run("queued", None),
-            Some(&[]),
-            &|_| None,
+            Maybe::Got(&[]),
+            &|_| Maybe::Waiting,
             60,
             40,
         ));
@@ -663,7 +698,69 @@ mod tests {
         let mut step = js[0].steps[0].clone();
         step.status = Some("in_progress".into());
         step.conclusion = None;
-        let text = plain(&step_body(&js[0], &step, None, 60, 40));
+        let text = plain(&step_body(&js[0], &step, Maybe::Waiting, 60, 40));
         assert!(text.contains("the log lands when the job completes"));
+    }
+
+    /// A jobs fetch that failed is not one still in flight. Told only "not
+    /// here", the body said `fetching jobs…` forever about a run whose jobs
+    /// the token was not allowed to read.
+    #[test]
+    fn jobs_that_could_not_be_fetched_are_not_still_being_fetched() {
+        let text = plain(&run_body(
+            &run("completed", Some("failure")),
+            Maybe::Cannot("gh auth refresh -h github.com -s repo".into()),
+            &|_| Maybe::Waiting,
+            60,
+            40,
+        ));
+        assert!(!text.contains("fetching"), "{text}");
+        assert!(text.contains("could not list this run's jobs"), "{text}");
+        assert!(text.contains("gh auth refresh"), "lost the reason: {text}");
+    }
+
+    /// The same for a log, in all three bodies that show one. The reason is
+    /// on screen, and the structure around it still is.
+    #[test]
+    fn a_log_that_could_not_be_fetched_says_why() {
+        let why = || Maybe::Cannot("gh: Not Found (HTTP 404)".to_string());
+        let js = jobs();
+        let in_run = plain(&run_body(
+            &run("completed", Some("failure")),
+            Maybe::Got(&js),
+            &|_| why(),
+            60,
+            40,
+        ));
+        let in_job = plain(&job_body(&js[1], why().view(String::as_str), 60, 40));
+        let in_step = plain(&step_body(
+            &js[1],
+            &js[1].steps[0],
+            why().view(String::as_str),
+            60,
+            40,
+        ));
+        for text in [&in_run, &in_job, &in_step] {
+            assert!(!text.contains("fetching"), "{text}");
+            assert!(text.contains("could not fetch the log"), "{text}");
+            assert!(text.contains("Not Found"), "lost the reason: {text}");
+        }
+        assert!(in_run.contains("1 failed"), "lost the summary: {in_run}");
+    }
+
+    /// A step that has finished inside a job still going has no log to wait
+    /// for: GitHub serves one per COMPLETED job and none was asked for. It
+    /// said "fetching" about a request nobody had made.
+    #[test]
+    fn a_finished_step_in_a_running_job_is_not_fetching_anything() {
+        let mut job = jobs().remove(1);
+        job.status = Some("in_progress".into());
+        job.conclusion = None;
+        let in_step = plain(&step_body(&job, &job.steps[0], Maybe::Waiting, 60, 40));
+        let in_job = plain(&job_body(&job, Maybe::Waiting, 60, 40));
+        for text in [&in_step, &in_job] {
+            assert!(!text.contains("fetching"), "{text}");
+            assert!(text.contains(LOG_LATER), "{text}");
+        }
     }
 }

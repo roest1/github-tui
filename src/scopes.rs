@@ -42,7 +42,7 @@ use std::collections::BTreeSet;
 ///
 /// GitHub spells the ladder consistently: `read:x`, then `write:x`, then
 /// `admin:x`. Anything not on the ladder (`repo`, `gist`, `workflow`) sorts
-/// last and is taken as-is -- there is no narrower form of `repo` to prefer.
+/// after it, and among those `is_part_of` decides.
 const LADDER: &[&str] = &["read:", "write:", "admin:"];
 
 fn privilege(scope: &str) -> usize {
@@ -50,6 +50,25 @@ fn privilege(scope: &str) -> usize {
         .iter()
         .position(|p| scope.starts_with(p))
         .unwrap_or(LADDER.len())
+}
+
+/// Is `scope` a named part of `whole`?
+///
+/// Off the ladder GitHub narrows a scope by EXTENDING its name: `repo` covers
+/// `repo:status` and `repo_deployment`, `user` covers `user:email`. So the
+/// narrower one is the LONGER one, and ranking by length alone picked the
+/// parent every time -- an endpoint that would have taken `repo_deployment`
+/// was answered with a request for all of `repo`, which is every private
+/// repository's code.
+///
+/// Read off the names, so there is still no table. That misses the parts
+/// named differently from their parent (`public_repo`, `security_events`
+/// under `repo`); for those the suggestion stays the parent, which is broader
+/// than it has to be and never wrong.
+fn is_part_of(scope: &str, whole: &str) -> bool {
+    scope
+        .strip_prefix(whole)
+        .is_some_and(|rest| rest.starts_with([':', '_']))
 }
 
 /// The scopes a token carries, parsed from `X-Oauth-Scopes`.
@@ -107,7 +126,12 @@ impl Denied {
             return None;
         }
         let mut ranked = accepted.to_vec();
-        ranked.sort_by_key(|s| (privilege(s), s.len()));
+        // Least privilege first; then a scope that is part of another one on
+        // offer, ahead of the one it is part of.
+        ranked.sort_by_key(|s| {
+            let whole = !accepted.iter().any(|other| is_part_of(s, other));
+            (privilege(s), whole, s.len())
+        });
         Some(Self {
             suggest: ranked.first().cloned()?,
             accepted: accepted.to_vec(),
@@ -210,6 +234,31 @@ mod tests {
             Denied::from(&accepted, &granted).expect("denied").suggest,
             "repo"
         );
+    }
+
+    /// Off the ladder the narrower scope has the longer name, so the shorter
+    /// one must not win: asked for `repo` or `repo_deployment`, a token that
+    /// only needs deployments is not told to take every private repo.
+    #[test]
+    fn a_part_is_suggested_ahead_of_the_scope_it_is_part_of() {
+        let granted = Granted::parse("read:org");
+        let suggest = |accepted: &str| {
+            Denied::from(&header_list(accepted), &granted)
+                .expect("denied")
+                .suggest
+        };
+        assert_eq!(suggest("repo, repo_deployment"), "repo_deployment");
+        assert_eq!(suggest("repo_deployment, repo"), "repo_deployment");
+        assert_eq!(suggest("repo, repo:status"), "repo:status");
+        assert_eq!(suggest("user, user:email"), "user:email");
+        // Two unrelated flat scopes: neither is part of the other, and the
+        // order they were offered in does not decide it.
+        assert_eq!(suggest("workflow, repo"), "repo");
+        // A name that merely starts the same way is not a part.
+        assert!(!is_part_of("repository", "repo"));
+        assert!(!is_part_of("repo", "repo"));
+        // The ladder still outranks all of it.
+        assert_eq!(suggest("user, read:user, user:email"), "read:user");
     }
 
     /// The two cases that must NOT be reported as a permissions problem: an

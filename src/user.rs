@@ -28,20 +28,24 @@ use std::sync::Arc;
 use serde::Deserialize;
 use tui_core::{nav::Action, Flow, Host, Pane, Row, Screen, Tick};
 
-use crate::gh::{Fetcher, Got, Req};
-use crate::orgs::OrgList;
+use crate::gh::{Fetcher, Got, Req, PAGE};
+use crate::orgs::{cut_row, OrgList};
 use crate::paint::{idx, BOLD, DIM, GRN, GRY, OFF, ORG, PUR, RED, YEL};
 use crate::root::Root;
 
 /// Build the user-level screen.
 ///
-/// `here` is the repo the shell is standing in, if any -- it opens the Repos
-/// tab with that repo selected, which is what makes `github` in a repo feel
-/// like it opened where you were standing while still having the account
-/// underneath it.
-pub fn screen(fetch: Arc<Fetcher>, root: Root, login: &str) -> Host {
+/// `root` is the Repos tab, already focused on the repo the shell is standing
+/// in if there is one -- which is what makes `github` in a repo feel like it
+/// opened where you were standing while still having the account underneath
+/// it.
+///
+/// `login` labels the strip. `None` leaves the strip without a label rather
+/// than inventing one: a made-up name sits exactly where a real one would and
+/// reads as whose account this is.
+pub fn screen(fetch: Arc<Fetcher>, root: Root, login: Option<&str>) -> Host {
     Host::new(
-        Some(login.to_string()),
+        login.map(str::to_string),
         // Glyphs on the tabs, which is where they earn the most: the strip is
         // the thing you look at to navigate, and a shape is faster to find
         // than a word. The set is deliberately small and each one is a noun
@@ -61,21 +65,52 @@ pub fn screen(fetch: Arc<Fetcher>, root: Root, login: &str) -> Host {
     )
 }
 
-/// The login, read from `gh` rather than from the API.
+/// The login, read from `gh`'s config file and never from the network.
 ///
-/// `gh auth status` already knows it and answers instantly from a local config,
-/// where `/user` is a network round trip. The title strip needs it before the
-/// first frame, so the cheap local answer is the right one; the Account tab
-/// fetches the full profile afterwards.
-pub fn login() -> String {
-    std::process::Command::new("gh")
-        .args(["api", "user", "--jq", ".login"])
+/// This runs in front of the first frame, so it may only ask what is already
+/// on this disk. `gh config get` reads a local file. `gh api user` is a round
+/// trip, and so is `gh auth status`, which validates the token before it
+/// prints anything -- either one holds a blank terminal for as long as the
+/// network takes, and on a dead link that is until it times out. The Account
+/// tab fetches the full profile afterwards, off the main thread.
+///
+/// `None` when the config cannot say, and there is no stand-in: the answer is
+/// handed to the pull request filters as "me", and any word put here in its
+/// place -- `github` was one -- is somebody's real login.
+///
+/// A token in the environment is one of the cases it cannot say. `gh` uses
+/// `GH_TOKEN` or `GITHUB_TOKEN` in preference to its stored credentials, so
+/// the stored login is then not necessarily who the calls run as.
+pub fn login() -> Option<String> {
+    if token_in_env(|k| std::env::var(k).ok()) {
+        return None;
+    }
+    let out = std::process::Command::new("gh")
+        .args(["config", "get", "user", "-h", "github.com"])
+        .stdin(std::process::Stdio::null())
         .output()
         .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "github".into())
+        .filter(|o| o.status.success())?;
+    as_login(&String::from_utf8_lossy(&out.stdout))
+}
+
+fn token_in_env(var: impl Fn(&str) -> Option<String>) -> bool {
+    ["GH_TOKEN", "GITHUB_TOKEN"]
+        .iter()
+        .any(|k| var(k).is_some_and(|v| !v.is_empty()))
+}
+
+/// What `gh config get user` printed, if that is a login.
+///
+/// Checked rather than trusted, because whatever comes back is used as a
+/// name: letters, digits and hyphens, plus the underscore a managed account
+/// carries. Anything else is a message, not a person.
+fn as_login(printed: &str) -> Option<String> {
+    let s = printed.trim();
+    let ok = !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    ok.then(|| s.to_string())
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -114,11 +149,29 @@ enum AccountRow {
     NoApi,
 }
 
+/// What is known about the token's scopes, which is not the same question as
+/// whether it has any.
+enum Scopes {
+    Granted(crate::scopes::Granted),
+    /// No response has come back yet.
+    Asking,
+    /// GitHub answered and named none. A fine-grained or app token sends no
+    /// `X-OAuth-Scopes` header at all, so for those this is the final answer
+    /// and "asking" would be shown for the life of the session.
+    Unreported,
+    /// The call failed, so nothing was learned either way.
+    Unknown,
+}
+
 impl Account {
-    fn new(fetch: Arc<Fetcher>) -> Self {
-        fetch.request(Req::Json {
+    fn profile_req() -> Req {
+        Req::Json {
             path: "user".into(),
-        });
+        }
+    }
+
+    fn new(fetch: Arc<Fetcher>) -> Self {
+        fetch.request(Self::profile_req());
         Self {
             fetch,
             profile: None,
@@ -136,11 +189,23 @@ impl Account {
         }
     }
 
+    /// Read off the profile request, because that is the one call this tab
+    /// knows it made: once it has an answer, the header has had its chance.
+    fn scopes(&self) -> Scopes {
+        let granted = self.fetch.granted();
+        if !granted.is_empty() {
+            return Scopes::Granted(granted);
+        }
+        match self.fetch.get(&Self::profile_req()) {
+            Some(Got::Json(_)) | Some(Got::Denied(_)) => Scopes::Unreported,
+            Some(Got::Failed(_)) => Scopes::Unknown,
+            _ => Scopes::Asking,
+        }
+    }
+
     fn sync(&mut self) {
-        match self.fetch.get(&Req::Json {
-            path: "user".into(),
-        }) {
-            Some(Got::Json(v)) => match serde_json::from_value::<Profile>(v.as_ref().clone()) {
+        match self.fetch.get(&Self::profile_req()) {
+            Some(Got::Json(v)) => match Profile::deserialize(v.as_ref()) {
                 Ok(p) => {
                     self.profile = Some(p);
                     self.error = None;
@@ -164,29 +229,31 @@ impl Screen for Account {
     }
 
     fn tick(&mut self) -> Tick {
-        let now = self.fetch.epoch();
-        if now != self.epoch_seen {
-            self.epoch_seen = now;
+        if self.fetch.landed(&mut self.epoch_seen) {
             self.sync();
             return Tick::Changed;
         }
-        Tick::Idle
+        // Without this the tab goes idle on "fetching..." with the profile
+        // still on its way, and draws it on the next keypress.
+        self.fetch.waiting()
     }
 
     fn rows(&mut self) -> Vec<Row> {
-        let granted = self.fetch.granted();
-        let scope_detail = if granted.is_empty() {
-            "asking\u{2026}".to_string()
-        } else {
-            format!("{} granted", granted.list().len())
+        let scope_detail = match self.scopes() {
+            Scopes::Granted(g) => format!("{} granted", g.list().len()),
+            Scopes::Asking => "asking\u{2026}".to_string(),
+            Scopes::Unreported => "none reported".to_string(),
+            Scopes::Unknown => "unknown".to_string(),
+        };
+        // A profile that failed is not one still being fetched, and the row
+        // is what you see without selecting it.
+        let profile = match (&self.profile, &self.error) {
+            (Some(p), _) => Row::leaf("profile").detail(p.login.clone()),
+            (None, Some(_)) => Row::leaf("profile").badged("error", idx::RED),
+            (None, None) => Row::leaf("profile").detail("fetching\u{2026}"),
         };
         vec![
-            Row::leaf("profile").detail(
-                self.profile
-                    .as_ref()
-                    .map(|p| p.login.clone())
-                    .unwrap_or_else(|| "fetching\u{2026}".into()),
-            ),
+            profile,
             Row::leaf("token scopes").detail(scope_detail),
             Row::leaf("not available here").detail("tokens, 2FA"),
         ]
@@ -239,12 +306,27 @@ impl Screen for Account {
             AccountRow::Scopes => {
                 lines.push(format!("{BOLD}What this token may do{OFF}"));
                 lines.push(crate::paint::rule(cols));
-                let granted = self.fetch.granted();
-                if granted.is_empty() {
-                    lines.push(format!("{DIM}waiting for the first response\u{2026}{OFF}"));
-                } else {
-                    for s in granted.list() {
-                        lines.push(format!("  {GRN}\u{2713}{OFF} {s}"));
+                match self.scopes() {
+                    Scopes::Granted(granted) => {
+                        for s in granted.list() {
+                            lines.push(format!("  {GRN}\u{2713}{OFF} {s}"));
+                        }
+                    }
+                    Scopes::Asking => {
+                        lines.push(format!("{DIM}waiting for the first response\u{2026}{OFF}"));
+                    }
+                    Scopes::Unreported => {
+                        lines.push("GitHub answered, and named no scopes.".into());
+                        lines.push(String::new());
+                        lines.push(format!(
+                            "{DIM}A fine-grained or app token has permissions{OFF}"
+                        ));
+                        lines.push(format!(
+                            "{DIM}rather than scopes, and no header lists those.{OFF}"
+                        ));
+                    }
+                    Scopes::Unknown => {
+                        lines.push(format!("{YEL}The call that would have said failed.{OFF}"));
                     }
                 }
                 lines.push(String::new());
@@ -328,6 +410,14 @@ struct Lane {
     state: LaneState,
 }
 
+/// The request behind a lane. A full page is asked for, because the default
+/// is thirty and a lane that stopped there would look complete.
+fn lane_req(path: &str) -> Req {
+    Req::Json {
+        path: format!("{path}?per_page={PAGE}"),
+    }
+}
+
 enum LaneState {
     Waiting,
     /// Rendered rows, already formatted -- each lane's shape differs enough
@@ -383,9 +473,7 @@ impl Keys {
             },
         ];
         for l in &lanes {
-            fetch.request(Req::Json {
-                path: l.path.into(),
-            });
+            fetch.request(lane_req(l.path));
         }
         let open = vec![true; lanes.len()];
         Self {
@@ -400,19 +488,21 @@ impl Keys {
 
     fn refresh_all(&self) {
         for lane in &self.lanes {
-            self.fetch.refresh(Req::Json {
-                path: lane.path.into(),
-            });
+            self.fetch.refresh(lane_req(lane.path));
         }
     }
 
     fn sync(&mut self) {
         for lane in self.lanes.iter_mut() {
-            let got = self.fetch.get(&Req::Json {
-                path: lane.path.into(),
-            });
+            let got = self.fetch.get(&lane_req(lane.path));
             lane.state = match got {
-                Some(Got::Json(v)) => LaneState::Items(render_lane(lane.path, &v)),
+                // A reply that does not parse is a failure. Read as an empty
+                // list it says "this account has none", with the token's
+                // blessing, about keys that were simply not understood.
+                Some(Got::Json(v)) => match render_lane(lane.path, &v) {
+                    Ok(items) => LaneState::Items(items),
+                    Err(e) => LaneState::Failed(e),
+                },
                 // The reason this screen exists. `GET /user/keys` without the
                 // scope answers 404, which as an empty list reads as "you have
                 // no SSH keys" on an account with two.
@@ -431,11 +521,7 @@ impl Keys {
             }
             row += 1;
             if self.open[l] {
-                let n = match &lane.state {
-                    LaneState::Items(items) => items.len(),
-                    _ => 1, // the one explanatory row
-                };
-                for _ in 0..n {
+                for _ in 0..lane.state.rows_under() {
                     if sel == row {
                         return At::Item(l);
                     }
@@ -448,16 +534,43 @@ impl Keys {
     }
 }
 
+impl LaneState {
+    /// How many rows `rows()` draws under an open lane in this state.
+    ///
+    /// The one place that says it, because `at` counting differently from
+    /// what was drawn reads every row below one off. An EMPTY lane draws a
+    /// "none on this account" row, and counting it as zero put the cursor on
+    /// the next lane's heading while the keys went to that lane's first child
+    /// -- so `enter` to collapse a heading ran `gh auth refresh` instead.
+    fn rows_under(&self) -> usize {
+        match self {
+            LaneState::Items(items) => items.len().max(1) + usize::from(self.cut()),
+            _ => 1, // the one explanatory row
+        }
+    }
+
+    /// A full page came back, so there may be more than is shown. Drawn as a
+    /// row of its own; a list that stops without saying so reads as the whole
+    /// list.
+    fn cut(&self) -> bool {
+        matches!(self, LaneState::Items(items) if items.len() >= PAGE)
+    }
+}
+
 /// Turn one lane's JSON into (label, detail) pairs.
 ///
 /// Per-path rather than a trait, because three shapes do not justify one and
 /// the differences are the point: an SSH key is identified by its title, a GPG
 /// key by its key id and the emails it covers.
-fn render_lane(path: &str, v: &serde_json::Value) -> Vec<(String, String)> {
-    match path {
+///
+/// `Err` when the reply is not the list it should be, which is not the same
+/// answer as an empty list and must not be drawn as one.
+fn render_lane(path: &str, v: &serde_json::Value) -> Result<Vec<(String, String)>, String> {
+    let unreadable = |e: serde_json::Error| format!("unreadable response from {path}: {e}");
+    Ok(match path {
         "user/keys" | "user/ssh_signing_keys" => {
-            serde_json::from_value::<Vec<SshKey>>(v.clone())
-                .unwrap_or_default()
+            Vec::<SshKey>::deserialize(v)
+                .map_err(unreadable)?
                 .into_iter()
                 .map(|k| {
                     let label = k
@@ -480,8 +593,8 @@ fn render_lane(path: &str, v: &serde_json::Value) -> Vec<(String, String)> {
                 })
                 .collect()
         }
-        "user/gpg_keys" => serde_json::from_value::<Vec<GpgKey>>(v.clone())
-            .unwrap_or_default()
+        "user/gpg_keys" => Vec::<GpgKey>::deserialize(v)
+            .map_err(unreadable)?
             .into_iter()
             .map(|k| {
                 let who = k
@@ -498,7 +611,7 @@ fn render_lane(path: &str, v: &serde_json::Value) -> Vec<(String, String)> {
             })
             .collect(),
         _ => Vec::new(),
-    }
+    })
 }
 
 impl Screen for Keys {
@@ -517,16 +630,11 @@ impl Screen for Keys {
             self.refresh_all();
             return Tick::Changed;
         }
-        let now = self.fetch.epoch();
-        if now != self.epoch_seen {
-            self.epoch_seen = now;
+        if self.fetch.landed(&mut self.epoch_seen) {
             self.sync();
             return Tick::Changed;
         }
-        if self.fetch.pending() {
-            return Tick::Wake(std::time::Duration::from_millis(100));
-        }
-        Tick::Idle
+        self.fetch.waiting()
     }
 
     fn rows(&mut self) -> Vec<Row> {
@@ -537,7 +645,8 @@ impl Screen for Keys {
                 LaneState::Items(items) => (
                     match items.len() {
                         0 => "none".to_string(),
-                        1 => "1".to_string(),
+                        // A count that might be short is not a count.
+                        n if lane.state.cut() => format!("{n}+"),
                         n => n.to_string(),
                     },
                     None,
@@ -557,17 +666,22 @@ impl Screen for Keys {
             rows.push(r);
             if self.open[l] {
                 match &lane.state {
-                    LaneState::Items(items) if !items.is_empty() => {
+                    LaneState::Items(items) => {
                         for (label, detail) in items {
                             let mut r = Row::leaf(label);
                             r.depth = 1;
                             rows.push(r.detail(detail));
                         }
-                    }
-                    LaneState::Items(_) => {
-                        let mut r = Row::leaf("none on this account");
-                        r.depth = 1;
-                        rows.push(r);
+                        if items.is_empty() {
+                            let mut r = Row::leaf("none on this account");
+                            r.depth = 1;
+                            rows.push(r);
+                        }
+                        if lane.state.cut() {
+                            let mut r = cut_row("there may be more");
+                            r.depth = 1;
+                            rows.push(r);
+                        }
                     }
                     LaneState::Denied(d) => {
                         let mut r = Row::leaf(format!("needs {}", d.suggest));
@@ -616,6 +730,13 @@ impl Screen for Keys {
                     lines.push(format!("{PUR}{label}{OFF}"));
                     lines.push(format!("  {GRY}{detail}{OFF}"));
                 }
+                if lane.state.cut() {
+                    lines.push(String::new());
+                    lines.push(format!(
+                        "{YEL}Only the first {PAGE} are shown.{OFF} GitHub sent a"
+                    ));
+                    lines.push("full page, so there may be more.".into());
+                }
             }
             LaneState::Denied(d) => {
                 lines.push(format!("{YEL}Your token cannot read this.{OFF}"));
@@ -659,25 +780,36 @@ impl Screen for Keys {
         // which is exactly what `Flow::Detach` hands it. It is also
         // self-confirming: gh says what it is about to do and waits for a
         // keypress, so there is nothing for this screen to ask first.
-        if let At::Item(l) = self.at(sel) {
-            if let LaneState::Denied(d) = &self.lanes[l].state {
-                if matches!(action, Action::Activate | Action::Open) {
-                    self.reauthorised = true;
-                    return Flow::Detach(vec![
-                        "gh".into(),
-                        "auth".into(),
-                        "refresh".into(),
-                        "-h".into(),
-                        "github.com".into(),
-                        "-s".into(),
-                        d.suggest.clone(),
-                    ]);
-                }
-            }
-        }
+        //
+        // `enter` alone. `l` is a direction: it reaches the pane, where the
+        // command is spelt out, and a key pressed to go and read what a row
+        // would do must not be the key that does it.
         match (action, self.at(sel)) {
-            (Action::Activate | Action::Open, At::Lane(l)) => {
+            (Action::Activate, At::Item(l)) => {
+                let LaneState::Denied(d) = &self.lanes[l].state else {
+                    return Flow::Continue;
+                };
+                let scope = d.suggest.clone();
+                self.reauthorised = true;
+                Flow::Detach(vec![
+                    "gh".into(),
+                    "auth".into(),
+                    "refresh".into(),
+                    "-h".into(),
+                    "github.com".into(),
+                    "-s".into(),
+                    scope,
+                ])
+            }
+            (Action::Activate, At::Lane(l)) => {
                 self.open[l] = !self.open[l];
+                Flow::Dirty
+            }
+            // `l` opens a closed lane and otherwise moves on. Toggling here
+            // made it close an open one, which is `h`'s job, and left the
+            // pane beside a heading unreachable.
+            (Action::Open, At::Lane(l)) if !self.open[l] => {
+                self.open[l] = true;
                 Flow::Dirty
             }
             (Action::Close, At::Lane(l)) => {
@@ -714,7 +846,7 @@ mod tests {
                 {"id":2,"key":"ssh-rsa AAAAB3NzaC1yc2EAAAADzzzzzzzz","title":""}]"#,
         )
         .expect("parses");
-        let rows = render_lane("user/keys", &v);
+        let rows = render_lane("user/keys", &v).expect("a key list");
         assert_eq!(rows[0].0, "laptop");
         assert!(rows[0].1.starts_with("ssh-ed25519"));
         assert!(rows[0].1.contains("abcdefgh"), "{:?}", rows[0].1);
@@ -728,7 +860,7 @@ mod tests {
             r#"[{"key_id":"ABC123","can_sign":true,"emails":[{"email":"me@example.com"}]}]"#,
         )
         .expect("parses");
-        let rows = render_lane("user/gpg_keys", &v);
+        let rows = render_lane("user/gpg_keys", &v).expect("a key list");
         assert_eq!(rows[0].0, "ABC123");
         assert!(rows[0].1.contains("me@example.com"));
         assert!(rows[0].1.contains("can sign"));
@@ -739,8 +871,259 @@ mod tests {
     fn a_gpg_key_with_no_email_still_renders() {
         let v: serde_json::Value =
             serde_json::from_str(r#"[{"key_id":"NOEMAIL","emails":[]}]"#).expect("parses");
-        let rows = render_lane("user/gpg_keys", &v);
+        let rows = render_lane("user/gpg_keys", &v).expect("a key list");
         assert!(rows[0].1.contains("no email"));
         assert!(rows[0].1.contains("cannot sign"));
+    }
+
+    const PATHS: [&str; 3] = ["user/keys", "user/gpg_keys", "user/ssh_signing_keys"];
+
+    fn json(text: &str) -> Got {
+        Got::Json(Arc::new(serde_json::from_str(text).expect("parses")))
+    }
+
+    fn ssh_keys(n: usize) -> Got {
+        let keys: Vec<String> = (0..n)
+            .map(|i| format!(r#"{{"id":{i},"key":"ssh-ed25519 AAAA{i:08}","title":"k{i}"}}"#))
+            .collect();
+        json(&format!("[{}]", keys.join(",")))
+    }
+
+    fn denied(scope: &str) -> Got {
+        Got::Denied(crate::scopes::Denied {
+            accepted: vec![scope.to_string()],
+            suggest: scope.to_string(),
+        })
+    }
+
+    /// The Keys tab over three answers already in hand. Seeded BEFORE the
+    /// screen is built, so `Keys::new` finds every lane answered and nothing
+    /// is asked of the network.
+    fn keys(answers: [Got; 3]) -> Keys {
+        let fetch = Arc::new(Fetcher::new(""));
+        for (path, got) in PATHS.iter().zip(answers) {
+            fetch.seed(lane_req(path), got);
+        }
+        let mut k = Keys::new(fetch);
+        k.sync();
+        k
+    }
+
+    /// Every index must resolve to the row actually drawn at it: a heading to
+    /// its lane, a row under it to that same lane, a spacer to nothing.
+    fn walk_agrees(k: &mut Keys) {
+        let rows = k.rows();
+        let mut lane = None;
+        for (i, row) in rows.iter().enumerate() {
+            match k.at(i) {
+                At::Lane(l) => {
+                    assert!(row.group, "row {i} ({}) read as a heading", row.label);
+                    assert_eq!(row.label, k.lanes[l].name);
+                    lane = Some(l);
+                }
+                At::Item(l) => {
+                    assert!(row.selectable && !row.group, "row {i} read as an item");
+                    assert_eq!(Some(l), lane, "row {i} ({}) read off its lane", row.label);
+                }
+                At::Nothing => assert!(!row.selectable, "row {i} ({}) is nothing", row.label),
+            }
+        }
+        assert!(matches!(k.at(rows.len()), At::Nothing));
+    }
+
+    #[test]
+    fn the_walk_matches_the_rows_in_every_lane_state() {
+        // Keys, an EMPTY lane, and a refusal -- the empty one in the middle,
+        // where miscounting it moves everything below.
+        let mut k = keys([ssh_keys(2), json("[]"), denied("read:ssh_signing_key")]);
+        walk_agrees(&mut k);
+        k.open[0] = false;
+        walk_agrees(&mut k);
+        k.open = vec![false; 3];
+        walk_agrees(&mut k);
+
+        // A failure, a lane still waiting, and a full page with its extra row.
+        let mut k = keys([Got::Failed("boom".into()), Got::Pending, ssh_keys(PAGE)]);
+        walk_agrees(&mut k);
+        // Every lane empty: three placeholders and no keys at all.
+        let mut k = keys([json("[]"), json("[]"), json("[]")]);
+        walk_agrees(&mut k);
+    }
+
+    /// The row an empty lane draws has to be counted, or the heading below it
+    /// is read as the row below THAT -- and `enter` meant to collapse the
+    /// signing keys ran `gh auth refresh` for them instead.
+    #[test]
+    fn enter_on_a_heading_below_an_empty_lane_collapses_that_heading() {
+        let mut k = keys([ssh_keys(1), json("[]"), denied("read:ssh_signing_key")]);
+        let rows = k.rows();
+        let head = rows
+            .iter()
+            .position(|r| r.label == k.lanes[2].name)
+            .expect("the signing heading");
+        assert_eq!(rows[head - 2].label, "none on this account");
+        assert!(matches!(k.on_action(Action::Activate, head), Flow::Dirty));
+        assert!(!k.open[2], "enter on the heading did not close it");
+        assert!(!k.reauthorised);
+    }
+
+    /// `l` is a direction. It opens a closed lane; on anything else it moves
+    /// on, and in particular it neither closes a lane nor hands the terminal
+    /// to `gh auth refresh`.
+    #[test]
+    fn l_opens_a_closed_lane_and_does_nothing_else() {
+        let mut k = keys([ssh_keys(1), json("[]"), denied("read:ssh_signing_key")]);
+        let rows = k.rows();
+        let fix = rows
+            .iter()
+            .position(|r| r.label.starts_with("needs "))
+            .expect("the refusal row");
+        assert!(matches!(k.on_action(Action::Open, fix), Flow::Continue));
+        assert!(!k.reauthorised, "l ran the authorisation");
+
+        assert!(matches!(k.on_action(Action::Open, 0), Flow::Continue));
+        assert!(k.open[0], "l closed an open lane");
+        k.open[0] = false;
+        assert!(matches!(k.on_action(Action::Open, 0), Flow::Dirty));
+        assert!(k.open[0], "l did not open a closed lane");
+
+        // `enter` is still the key that does the thing.
+        let fix = k
+            .rows()
+            .iter()
+            .position(|r| r.label.starts_with("needs "))
+            .expect("the refusal row");
+        match k.on_action(Action::Activate, fix) {
+            Flow::Detach(argv) => assert_eq!(
+                argv.join(" "),
+                "gh auth refresh -h github.com -s read:ssh_signing_key"
+            ),
+            _ => panic!("enter on the refusal row did not run the fix"),
+        }
+        assert!(k.reauthorised);
+    }
+
+    /// A reply that is not a key list is a failure. As an empty list it reads
+    /// "this account has none" -- an answer nobody gave.
+    #[test]
+    fn a_reply_that_is_not_a_key_list_is_an_error_not_an_empty_lane() {
+        let wrong: serde_json::Value = serde_json::from_str(r#"{"message":"x"}"#).expect("parses");
+        assert!(render_lane("user/keys", &wrong).is_err());
+        assert!(render_lane("user/gpg_keys", &wrong).is_err());
+
+        let mut k = keys([json(r#"{"message":"x"}"#), json("[]"), json("[]")]);
+        assert!(matches!(k.lanes[0].state, LaneState::Failed(_)));
+        let rows = k.rows();
+        assert_eq!(rows[1].label, "could not read");
+        let pane = k.pane(1, 80, 24).lines.join("\n");
+        assert!(!pane.contains("has none"), "{pane}");
+    }
+
+    /// A full page may not be the whole list, and the lane has to say so: a
+    /// row under it, a count that admits it, and a line in the pane.
+    #[test]
+    fn a_full_page_of_keys_says_it_may_have_been_cut() {
+        let mut k = keys([ssh_keys(PAGE), json("[]"), ssh_keys(PAGE - 1)]);
+        let rows = k.rows();
+        assert_eq!(rows[0].detail.as_deref(), Some("100+"));
+        assert_eq!(rows[PAGE + 1].label, "first 100 shown");
+        assert!(k.pane(0, 80, 24).lines.join("\n").contains("first 100"));
+        // One short of a page is the whole list, and says nothing.
+        let whole = rows
+            .iter()
+            .position(|r| r.label == k.lanes[2].name)
+            .expect("the signing heading");
+        assert_eq!(rows[whole].detail.as_deref(), Some("99"));
+        assert!(!rows[whole + 1..]
+            .iter()
+            .any(|r| r.label.starts_with("first ")));
+        // The request asks for a page of that size, or thirty would come back.
+        assert_eq!(
+            lane_req("user/keys"),
+            Req::Json {
+                path: "user/keys?per_page=100".into()
+            }
+        );
+    }
+
+    /// The Account tab over a profile answer already in hand.
+    fn account(profile: Got) -> Account {
+        let fetch = Arc::new(Fetcher::new(""));
+        fetch.seed(Account::profile_req(), profile);
+        let mut a = Account::new(fetch);
+        a.sync();
+        a
+    }
+
+    /// With the profile still on its way the tab has to keep looking, or it
+    /// sits on "fetching" until a key is pressed.
+    #[test]
+    fn the_account_tab_stays_awake_while_a_request_is_in_flight() {
+        let mut a = account(Got::Pending);
+        // Something in flight that cannot reach the network: `gh` rejects the
+        // flag. Whether it has landed yet or not, idle is the wrong answer.
+        a.fetch.refresh(Req::Cmd {
+            args: vec!["--definitely-not-a-gh-flag".into()],
+        });
+        assert!(!matches!(a.tick(), Tick::Idle));
+    }
+
+    /// A fine-grained token sends no scopes header, so an answer in hand with
+    /// no scopes learned is the final state and must not read as waiting.
+    #[test]
+    fn a_token_that_reports_no_scopes_is_not_asked_about_forever() {
+        let mut a = account(json(r#"{"login":"octocat"}"#));
+        let rows = a.rows();
+        assert_eq!(rows[0].detail.as_deref(), Some("octocat"));
+        assert_eq!(rows[1].detail.as_deref(), Some("none reported"));
+        assert!(!a.pane(1, 80, 24).lines.join("\n").contains("waiting"));
+
+        // Before anything has come back, it IS waiting.
+        let mut a = account(Got::Pending);
+        assert_eq!(a.rows()[1].detail.as_deref(), Some("asking\u{2026}"));
+    }
+
+    /// A profile that failed is not still being fetched.
+    #[test]
+    fn a_failed_profile_does_not_read_as_fetching() {
+        let mut a = account(Got::Failed("gh: Bad credentials (HTTP 401)".into()));
+        let rows = a.rows();
+        assert_ne!(rows[0].detail.as_deref(), Some("fetching\u{2026}"));
+        assert_eq!(rows[0].badges[0].0, "error");
+        assert_eq!(rows[1].detail.as_deref(), Some("unknown"));
+        assert!(a
+            .pane(0, 80, 24)
+            .lines
+            .join("\n")
+            .contains("Bad credentials"));
+    }
+
+    /// Only something that can be a login is taken as one: what comes back is
+    /// offered to the pull request filters as a person.
+    #[test]
+    fn the_login_is_what_gh_printed_or_nothing() {
+        assert_eq!(as_login("roest1\n").as_deref(), Some("roest1"));
+        assert_eq!(as_login("some-one_corp").as_deref(), Some("some-one_corp"));
+        assert_eq!(as_login(""), None);
+        assert_eq!(as_login("\n"), None);
+        assert_eq!(as_login("could not find key \"user\""), None);
+    }
+
+    /// A token in the environment outranks the stored account, so the stored
+    /// login is then not who the calls run as.
+    #[test]
+    fn a_token_in_the_environment_means_the_stored_login_is_not_me() {
+        let env = |set: &'static [(&'static str, &'static str)]| {
+            move |k: &str| {
+                set.iter()
+                    .find(|(name, _)| *name == k)
+                    .map(|(_, v)| v.to_string())
+            }
+        };
+        assert!(token_in_env(env(&[("GH_TOKEN", "t")])));
+        assert!(token_in_env(env(&[("GITHUB_TOKEN", "t")])));
+        assert!(!token_in_env(env(&[])));
+        // Set but empty is how a variable gets "unset" in a wrapper script.
+        assert!(!token_in_env(env(&[("GH_TOKEN", "")])));
     }
 }

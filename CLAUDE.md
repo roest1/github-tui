@@ -9,19 +9,78 @@ of dotfiles on 2026-11-23 with its history. The entries below moved from dotfile
 
 ## Layout
 
-- `src/` — the port. `branches` (the full-width branch table), `menu` (a
-  row's actions — the design's three-dots), `user` (the user level — the root, and its Account and
-  Keys tabs), `orgs` (the org list and one org's three tabs), `index` (every
-  clone under `~/github`, read from disk), `root` (the repo tree — the user
-  level's Repos tab), `runs` (the Actions screen), `steps` (one run as a tree),
-  `gh` (the threaded `gh api` caller and the cross-session cache), `scopes`
-  (what the token may do, asked of the token), `model` (the API's types and the
-  one place that says what a status MEANS), `render` (the pane bodies), `logs`
-  (step slicing and log colouring), `time` (ISO 8601 without a date crate),
-  `paint` (the palette), plus the lib/bin pair. **Not installed yet** — see
-  below.
+- `src/` — the port. `branches` (the full-width branch table), `prs` (pull
+  requests: filters in a sidebar, the list beside it), `secrets`, `envs`
+  (environments, and the reviewer picker), `rules` (the rulesets that apply to a
+  branch, read-only), `menu` (a row's actions — the design's three-dots),
+  `user` (the user level — the root, and its Account and Keys tabs), `orgs`
+  (the org list and one org's three tabs), `index` (every clone under
+  `~/github`, read from disk), `root` (the repo tree — the user level's Repos
+  tab), `runs` (the Actions screen), `steps` (one run as a tree), `gh` (the
+  threaded `gh api` caller and the cross-session cache), `scopes` (what the
+  token may do, asked of the token), `model` (the API's types and the one place
+  that says what a status MEANS), `render` (the pane bodies), `logs` (step
+  slicing, log colouring, and scrubbing what a log may send a terminal), `time`
+  (ISO 8601 without a date crate), `paint` (the palette), plus the lib/bin
+  pair.
 
 ## Things not to undo
+
+- **Eight rules every screen follows, because each was broken in most of them.**
+  A review found the same handful of mistakes screen after screen:
+
+  1. *A placeholder or error row is a row.* When one row stands in for the
+     items, the row walk resolves it to nothing. With the list failed and the
+     old runs still held, `e` then `y` on "could not list runs" reran a run that
+     was not on screen. Each screen has a rows/`at` agreement test covering its
+     error and empty shapes.
+  2. *A menu item that writes asks first.* `menu::check` holds the one audit —
+     what counts as a read, which verbs `gh` prompts for itself — and each
+     screen's structural test runs every item it can build through it.
+  3. *`l` only opens or moves on.* It never runs, pushes or closes.
+  4. *No command depends on the working directory.* `--repo` on every `gh`,
+     `-C` on every `git`, and `Item::in_dir` for the commands that have no flag
+     for it.
+  5. *After a write, re-read.* A menu built with `.marks(&writes)` counts each
+     command it hands over, and the screen underneath re-asks when the count
+     has moved. Marking at OPEN refetched everything for a menu that was only
+     looked at.
+  6. *The cursor follows the item.* When the screen's own action moves rows —
+     a group closes, a dropdown is answered — it returns `Flow::Retarget` and
+     says where.
+  7. *One tick.* `Fetcher::landed(&mut seen)` then `Fetcher::waiting()`. The
+     order is load-bearing and lived in thirteen hand-written copies.
+  8. *Failed is not loading and not empty.* `gh::Maybe` carries the third state
+     to the pane; a refused list said "no workflow runs here yet".
+
+- **A log cannot drive the terminal.** A job's log is whatever a workflow
+  printed, and a fork's pull request runs its own. It is fetched with
+  `--allow-escape-sequences` for the colours, so `logs::scrub` keeps exactly
+  those — `ESC [ … m` — and drops every other escape, every control character
+  and every carriage return; `ESC ] 52` set the clipboard from the pane.
+  tui-core does the same to everything it draws, but the pager and the cache
+  file never pass through it, and names (`logs::plain`) lose their colours too.
+
+- **`cargo test` runs no `gh`.** The fetcher has no workers under `cfg(test)`,
+  does not prune and does not read the cache; a request stays in flight and a
+  test puts the answer in with `Fetcher::seed`. Screens ask as they are built,
+  so with a pool behind them one test run was about 118 real calls on whoever's
+  token was to hand.
+
+- **`gh run rerun` and `cancel` go through the fetcher** (`Req::Do`). Run on
+  the UI thread they froze the screen for a network round trip, with no
+  timeout.
+
+- **An environment's menu rebuilds itself after anything it runs.** Every PUT
+  carries the whole environment, composed from what the menu was opened with —
+  so a second change in the same menu sent the first one's old values back.
+  `EnvMenu` refuses every key until the environment has been read again, and
+  refuses for good if it is gone.
+
+- **`Menu` items that open a screen are built with `Act::open(|| …)`.** The
+  first is built ahead so its requests are already in flight; each later
+  `enter` builds another. Holding the one screen made the row good for a
+  single use, after which it closed the menu.
 
 - **A placeholder row is a ROW, and `at()` has to count it.** The Environments
   screen draws "no environments yet" when the list is empty, so the rows below
@@ -63,16 +122,16 @@ of dotfiles on 2026-11-23 with its history. The entries below moved from dotfile
   screen asking for a name and then opening something with it did nothing. It
   is an `if/else` so control still reaches the bottom of the loop.
 
-- **No emoji in a fixed-width column, and the branch marker is where that bit.**
-  The design asks for a lock glyph on protected branches. `U+1F512` is East
-  Asian Wide — two cells in wezterm, one in terminals that disagree — in the one
-  column whose entire job is being fixed-width. `★` and `●` are single-width
-  and already used here; protection is a `prot` text column on the right.
-  `branches::tests::the_marker_column_is_fixed_width` asserts every marker is
-  inside the BMP, and it also counts the prefix in CHARACTERS rather than
-  bytes: `str::find` returns a byte offset and `★` is three bytes, so the byte
-  version failed on a perfectly aligned row and would have passed on a broken
-  one whose counts cancelled.
+- **A fixed-width column is measured in CELLS, and the branch marker is where
+  that bit.** The design asks for a lock glyph on protected branches. `U+1F512`
+  is East Asian Wide — two cells — in the one column whose entire job is being
+  fixed-width, and for a while the answer was to keep emoji out of it. The
+  answer now is `tui_core::width`: the marker cell carries the lock and
+  `branches::tests::the_marker_column_is_fixed_width` asserts the column in
+  cells. It used to count the prefix in characters, and before that in bytes:
+  `str::find` returns a byte offset and `★` is three bytes, so the byte version
+  failed on a perfectly aligned row and would have passed on a broken one whose
+  counts cancelled.
 
 - **Every control is a dropdown, and bulk actions are a menu.** The PR mock
   draws state toggles, a sort order and a search in a header strip and five
@@ -82,10 +141,19 @@ of dotfiles on 2026-11-23 with its history. The entries below moved from dotfile
   side would need column focus inside a row, which is the axis this does not
   have.
 
-  `space` ticks a pull request, the key that toggles a section in `dots`. With
-  anything ticked the list grows a row saying how many, and `enter` on it opens
-  a `Menu` whose items act on the set — so bulk actions cost no new region and
-  no new keys, and inherit the confirm.
+  `space` ticks a pull request, the key that toggles a section in `dots`. The
+  first row of the list always says how many are ticked, and with any ticked
+  `enter` on it opens a `Menu` whose items act on the set — so bulk actions
+  cost no new region and no new keys, and inherit the confirm. The row is
+  ALWAYS there, a line of text while nothing is ticked: when it appeared with
+  the first tick it pushed every pull request down a row under a cursor that
+  stayed where it was, and the next `space` ticked a different one.
+
+  **A bulk action is `gh` once per pull request.** `gh pr close`, `reopen` and
+  `edit` take exactly one number, so one command naming three is a usage error
+  and nothing closes. The item is a `sh -c` loop (`EACH` in `prs.rs`) with the
+  numbers as its first argument and the `gh` call as the rest — arguments, never
+  script text. It is the one place a command goes through a shell.
 
   **Ticks are kept by NUMBER and dropdown picks by NAME**, never by position. A
   refresh reorders the list and grows the option lists, and a `Vec<bool>`
@@ -110,9 +178,10 @@ of dotfiles on 2026-11-23 with its history. The entries below moved from dotfile
   protected branch. Handing them the real terminal buys text entry,
   confirmation and error reporting in the tools' own words — so full
   functionality does NOT wait on a text-input widget. Showing the command in
-  the pane IS the confirmation; a destructive item is marked in the row, the
-  pane and the footer, and adds no prompt of its own, because the tool already
-  asks or already reports and two confirms is one too many.
+  the pane IS the confirmation. Where the tool itself stops and asks — `gh pr
+  create` for a title — the menu adds no prompt of its own, because two
+  confirms is one too many; where it only REPORTS afterwards, the menu asks
+  (see the entry above), and a destructive item always does.
 
 - **A long command WRAPS in the menu pane; it does not get truncated.**
   `argv.join(" ")` was fine while every item was `gh pr merge 86 --repo x`. An
@@ -227,9 +296,11 @@ of dotfiles on 2026-11-23 with its history. The entries below moved from dotfile
   fails the WHOLE command, so the fallback re-runs without it rather than
   trying to salvage a partial answer.
 
-  **Checks cost no extra call**: a run carries its `head_branch`, so the newest
-  run per branch is that branch's status, and the repo `Host` shares one
-  `Fetcher` across its tabs so Branches reuses what Actions asked for.
+  **Checks are one call of their own.** A run carries its `head_branch`, so the
+  newest run per branch is that branch's status — but only a run from THIS
+  repository, which is why Branches asks for the list itself (100, with
+  `head_repository`) rather than reading the 40 Actions asked for: a fork's
+  `main` would otherwise decorate this repo's.
 
   **The marker cell has THREE states, in one cell.** `●` you are on it, `○`
   you have it, blank it is only on the remote — which is the question in front
@@ -239,6 +310,14 @@ of dotfiles on 2026-11-23 with its history. The entries below moved from dotfile
   round. `U+25CB` is BMP and single-width, so the fixed-width assertion still
   holds. The menu's Checkout says which act it is about to perform, since
   creating a branch and moving to one are different things.
+
+  **Once GitHub's list is whole, it says which branches exist.** A
+  remote-tracking ref it does not name is dropped from the table, which is what
+  removes the old name after a rename, and it takes every other ref git has yet
+  to prune with it. That is the intended cost: the table is of branches you can
+  act on, and a menu on a branch GitHub no longer has only produces errors.
+  Until the list answers, or when it was cut at a page (`gh::PAGE`), git's refs
+  stand for the rest, so the table still draws before the first response.
 
   **"Your branches" matches on EMAIL.** Measured here: the same person authored
   commits as both `Riley Oest` and `roest1` — a local `user.name` and GitHub's
@@ -284,6 +363,14 @@ of dotfiles on 2026-11-23 with its history. The entries below moved from dotfile
   tick, via a flag rather than before the detach: the detach is what changes
   the token, so a request fired beforehand races it and comes back denied,
   which looks exactly like the authorisation having failed.
+
+- **Who "me" is comes from `gh config get user`, and may be nobody.**
+  `user::login` reads the stored login locally, in milliseconds, where it used
+  to be an API call before the first frame. With `GH_TOKEN` or `GITHUB_TOKEN`
+  set it answers `None`: `gh` prefers the environment's token, so the stored
+  login is not necessarily who the calls run as. Every caller takes the
+  `Option`; the pull request filters then pin no "me" row, since a blank one
+  would be an option that filters to nothing.
 
 - **Tokens and 2FA are said out loud, not shown as empty lists.** Neither has
   an API at any scope. A blank list reads as "none" and would be wrong, so the
@@ -467,10 +554,10 @@ of dotfiles on 2026-11-23 with its history. The entries below moved from dotfile
   8601 sorts lexicographically, so parsing them into instants would be slower
   and no more correct.
 
-- **Status words, not emoji, in a `Row::badge`.** The badge is right-aligned
-  into a fixed grid and an emoji is double-width in some terminals and single
-  in others, so a column of them lines up nowhere reliably. `ok`/`fail`/`run`
-  with a colour index does. The PANE is free prose and keeps the glyphs.
+- **A `Row::badge` is a glyph AND a word** — `✅ ok`, `❌ fail`. It used to be the
+  word alone, because an emoji is two cells and a column of them drifted; that
+  was arithmetic, and `tui_core::width` does it now. The glyph is what you find
+  without reading, the word is what survives a terminal that draws it oddly.
 
 - **One `Verdict`, derived in one place.** `status` and `conclusion` together
   have more states than anyone needs to reason about, and reasoning about them

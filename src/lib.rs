@@ -15,17 +15,11 @@
 //!     ENVIRONMENTS (the deployment gates, with a picker for the reviewers);
 //!   * the JOBS & STEPS screen — one run as a tree, with a pager on any log.
 //!
-//! What is left before the bash implementation can be deleted is one row and
-//! one decision, both named in `docs/decisions/github-parity.md`. That file is
-//! the gate, not a wish list: CI refuses to let `github` into `tui/deps.sh`'s
-//! `crates=()` while any row says `todo` or `partial`.
-//!
-//! Until then the two live side by side, and this crate is deliberately absent
-//! from `deps.conf` and `tui/deps.sh` — a bash function beats PATH and
-//! `github()` is still defined, so nothing installs a binary that could not
-//! win anyway. The commit that deletes the bash function is the one that adds
-//! this to both. A `github` that dispatches to both halves is the drift this
-//! repo keeps deleting.
+//! The bash implementation is gone: the swap happened on 2026-10-24, and this
+//! is the only `github` there is. `docs/decisions/github-parity.md` was the
+//! gate for that and is now the record of it -- a row per verb the bash
+//! version had, and for the four that were dropped, the argument for dropping
+//! them.
 //!
 //! See `docs/decisions/github-tui.md` for the port's shape and what is
 //! deliberately not being carried over.
@@ -53,24 +47,49 @@ pub mod user;
 /// Hand a URL to the desktop's browser, and say what happened.
 ///
 /// `xdg-open` on Linux, `open` on macOS -- the same pair `_open_url` in
-/// `bash_github` picks between. Spawned and forgotten: waiting on it would
+/// `bash_github` picked between. Not waited for on this thread: that would
 /// block the loop for as long as the browser takes to start, which on a cold
 /// Firefox is seconds.
 ///
 /// One copy, because there were four and the fifth would have been in a screen
 /// that had no other reason to know what an operating system is. The return
 /// value is a status line rather than a `Result` because every caller does the
-/// same thing with it -- puts it in the footer.
+/// same thing with it -- shows it. "opened" means the opener was started, which
+/// is all that can be known without waiting for it.
 pub fn browse(url: &str) -> String {
     let opener = if cfg!(target_os = "macos") {
         "open"
     } else {
         "xdg-open"
     };
-    match std::process::Command::new(opener).arg(url).spawn() {
+    match spawn_apart(std::process::Command::new(opener).arg(url)) {
         Ok(_) => format!("opened {url}"),
         Err(e) => format!("could not run {opener}: {e}"),
     }
+}
+
+/// Start a command that shares nothing with this terminal, and reap it.
+///
+/// All three streams go to `/dev/null`. Inherited, whatever the opener or the
+/// browser it starts decides to print -- a GTK warning, a sandbox notice --
+/// lands in the middle of the alternate screen, over rows the loop has no
+/// reason to redraw, and stays there.
+///
+/// And it is waited for, on a thread of its own, because a child nobody waits
+/// for stays in the process table as a zombie until this process exits: one
+/// per `o`, for the length of the session. The thread lives exactly as long
+/// as the child. The handle is returned so a test can wait for that; `browse`
+/// drops it.
+fn spawn_apart(cmd: &mut std::process::Command) -> std::io::Result<std::thread::JoinHandle<()>> {
+    use std::process::Stdio;
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    Ok(std::thread::spawn(move || {
+        let _ = child.wait();
+    }))
 }
 
 /// The tab mark: `gh_tui`, an OSC 1337 user var that wezterm reads.
@@ -129,7 +148,6 @@ fn write_tty(s: &str) {
 
 pub use root::Root;
 pub use runs::Actions;
-pub use steps::Steps;
 
 #[cfg(test)]
 mod tests {
@@ -149,5 +167,45 @@ mod tests {
             var_escape(MARK_OFF),
             "\u{1b}]1337;SetUserVar=gh_tui=MA==\u{7}"
         );
+    }
+
+    /// What the opener inherits, asked of the child itself: each of its three
+    /// streams has to be `/dev/null`, or its output is drawn over the screen.
+    /// Joining the returned thread is also the proof the child was waited
+    /// for -- the file is only complete once it has exited.
+    ///
+    /// Linux only, because `/proc` is how a process is asked what its
+    /// descriptors are. `$$` rather than `self`, since it is the shell's
+    /// streams that matter and not `readlink`'s.
+    ///
+    /// The answers are collected first and written afterwards. Appending each
+    /// one with `>> file` passed under bash and failed under dash, which is
+    /// `sh` on the CI runner: there the shell itself reported the file as its
+    /// stdout while the redirected command ran.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_spawned_opener_shares_no_stream_with_the_terminal() {
+        let seen = std::env::temp_dir().join(format!("github-opener-{}", std::process::id()));
+        let _ = std::fs::remove_file(&seen);
+        let reaper = spawn_apart(
+            std::process::Command::new("sh")
+                .arg("-c")
+                .arg(
+                    r#"seen=$(for fd in 0 1 2; do readlink /proc/$$/fd/$fd; done)
+                    printf '%s\n' "$seen" > "$0""#,
+                )
+                .arg(&seen),
+        )
+        .expect("sh runs");
+        reaper.join().expect("the child was waited for");
+        let streams = std::fs::read_to_string(&seen).expect("the child wrote what it saw");
+        let _ = std::fs::remove_file(&seen);
+        assert_eq!(streams, "/dev/null\n/dev/null\n/dev/null\n");
+    }
+
+    /// A missing opener is reported, not swallowed: the caller shows it.
+    #[test]
+    fn a_command_that_cannot_start_is_an_error() {
+        assert!(spawn_apart(&mut std::process::Command::new("github-tui-no-such-opener")).is_err());
     }
 }

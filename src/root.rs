@@ -20,6 +20,8 @@ use crate::index::{self, Remote, Repo};
 
 pub struct Root {
     /// The signed-in login, for the pull request screen's "me at the top".
+    /// Empty when it could not be read without the network; never a
+    /// placeholder, since it is offered on as a person to filter by.
     me: String,
     root: PathBuf,
     repos: Vec<Repo>,
@@ -45,6 +47,29 @@ enum At {
 impl Default for Root {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Are these two clones of one GitHub repository?
+///
+/// Only a GitHub remote is an identity. `slug()` is not: it answers `local
+/// only` for EVERY clone with no origin and the same `not github` line for
+/// every clone on one foreign host, so comparing slugs matched a repo with no
+/// remote to the first other repo with no remote, and `github` opened with
+/// the cursor on a clone that had nothing to do with where you were standing.
+///
+/// Case is ignored because GitHub ignores it: `Roest1/Site` and `roest1/site`
+/// are one repository, and remotes get typed both ways.
+fn same_github_repo(a: &Repo, b: &Repo) -> bool {
+    match (&a.remote, &b.remote) {
+        (
+            Remote::GitHub { owner, name },
+            Remote::GitHub {
+                owner: other_owner,
+                name: other_name,
+            },
+        ) => owner.eq_ignore_ascii_case(other_owner) && name.eq_ignore_ascii_case(other_name),
+        _ => false,
     }
 }
 
@@ -84,9 +109,9 @@ impl Root {
 
     /// Who is signed in, for the screens that need "me" in a list.
     ///
-    /// Passed in rather than looked up here: `user::login` shells out to `gh`,
-    /// and the root screen's whole claim is that it draws before anything
-    /// runs. The caller already knows it for the title strip.
+    /// Passed in rather than looked up here: the caller already has it for
+    /// the title strip, and this screen's whole claim is that it reads the
+    /// disk and nothing else.
     pub fn as_me(mut self, me: &str) -> Self {
         self.me = me.to_string();
         self
@@ -94,18 +119,18 @@ impl Root {
 
     /// Select this repo on arrival, opening its lane.
     ///
-    /// What `github` run inside a repo does: the seeded stack pushes the repo's
-    /// own screen on top, and this is what is underneath it, so `q` lands on
-    /// the row you came from rather than at the top of the list.
+    /// What `github` run inside a repo does: the list opens with the cursor
+    /// on the repo you are standing in, so `enter` is that repo and `q` back
+    /// out of it lands where you started rather than at the top.
     pub fn focused_on(mut self, repo: &Repo) -> Self {
         let found = self
             .repos
             .iter()
             .position(|r| r.path == repo.path)
             // A repo outside ~/github has no row here. Matching on identity
-            // rather than path then still lands on the right lane if a second
+            // rather than path then still lands on the right row if a second
             // clone of it happens to be filed in the index.
-            .or_else(|| self.repos.iter().position(|r| r.slug() == repo.slug()));
+            .or_else(|| self.repos.iter().position(|r| same_github_repo(r, repo)));
         let Some(i) = found else {
             return self;
         };
@@ -251,7 +276,7 @@ impl Root {
                 let slug = repo.slug();
                 let branches =
                     crate::branches::Branches::open(&slug, &repo.path, actions.fetcher());
-                let prs = crate::prs::Prs::open(&slug, &self.me, actions.fetcher());
+                let prs = crate::prs::Prs::open(&slug, &self.me, &repo.path, actions.fetcher());
                 let secrets = crate::secrets::Secrets::open(&slug, actions.fetcher());
                 let envs = crate::envs::Envs::open(&slug, actions.fetcher());
                 Flow::Push(Box::new(tui_core::Host::new(
@@ -405,19 +430,22 @@ impl Screen for Root {
     fn on_action(&mut self, action: Action, sel: usize) -> Flow {
         self.status.clear();
         match (action, self.at(sel)) {
-            (Action::Activate | Action::Open, At::Lane(l)) => {
+            (Action::Activate, At::Lane(l)) => {
                 self.open[l] = !self.open[l];
+                Flow::Dirty
+            }
+            // `l` opens a closed lane and otherwise moves on into the pane.
+            // As a toggle it closed an open lane, which is `h`'s job, and the
+            // pane beside a lane heading could not be reached at all.
+            (Action::Open, At::Lane(l)) if !self.open[l] => {
+                self.open[l] = true;
                 Flow::Dirty
             }
             (Action::Close, At::Lane(l)) => {
                 self.open[l] = false;
                 Flow::Dirty
             }
-            // The repo's screens. Actions is the one that exists, so enter
-            // goes straight to it rather than through a hub of one row -- when
-            // PRs and Branches land, this becomes the repo screen with Actions
-            // as its first row, and `app::run_stack` already takes the deeper
-            // seeded stack that implies.
+            // The repo's screens, as tabs -- see `open_repo`.
             // `Activate` only. `l` on a repo falls through to the pane, which
             // is what makes hjkl work as directions rather than as a second
             // enter -- see `Action::Open`.
@@ -433,7 +461,7 @@ impl Screen for Root {
     fn footer(&self) -> String {
         match self.at(self.focus_sel) {
             At::Lane(_) => "enter open/close".into(),
-            At::Repo(i) if self.repos[i].is_github() => "enter actions \u{b7} o browser".into(),
+            At::Repo(i) if self.repos[i].is_github() => "enter open \u{b7} o browser".into(),
             At::Repo(_) => "o browser \u{b7} nothing on github to ask about".into(),
             At::Nothing => "j/k move · h/l close/open".into(),
         }
@@ -547,6 +575,69 @@ mod tests {
         assert_eq!(r.focused_on(&here).initial_sel(), 0);
     }
 
+    /// A clone with no remote is not "the same repo" as another clone with no
+    /// remote, and neither are two unrelated clones on one foreign host. From
+    /// a stray one of either, the list opens at the top -- not on whichever
+    /// indexed clone happens to describe itself in the same words.
+    #[test]
+    fn a_stray_repo_with_no_github_remote_matches_nothing_in_the_index() {
+        let indexed = || {
+            Root::rooted(tree(
+                "no-identity",
+                &[
+                    ("public/mdgest", "git@github.com:roest1/mdgest.git"),
+                    ("public/notes", ""),
+                    ("public/work", "git@gitlab.example.com:team/work.git"),
+                ],
+            ))
+        };
+        let other = tree(
+            "no-identity-src",
+            &[
+                ("scratch", ""),
+                ("theirs", "git@gitlab.example.com:other/theirs.git"),
+            ],
+        );
+        for dir in ["scratch", "theirs"] {
+            let here = index::current(&other.join(dir), &other).expect("a repo");
+            assert!(!here.is_github());
+            // The premise: the old comparison would have found a match.
+            let r = indexed();
+            assert!(r.repos.iter().any(|x| x.slug() == here.slug()), "{dir}");
+            assert_eq!(r.focused_on(&here).initial_sel(), 0, "{dir}");
+        }
+    }
+
+    /// The fallback that IS right: a second clone of the same GitHub repo,
+    /// outside the index, lands on the indexed one -- however its remote
+    /// happens to be capitalised.
+    #[test]
+    fn a_stray_clone_of_an_indexed_github_repo_lands_on_it() {
+        let r = sample("second-clone");
+        let other = tree(
+            "second-clone-src",
+            &[("elsewhere", "https://github.com/Acme-Co/Platform.git")],
+        );
+        let here = index::current(&other.join("elsewhere"), &other).expect("a repo");
+        let mut r = r.focused_on(&here);
+        let sel = r.initial_sel();
+        assert_eq!(r.rows()[sel].label, "platform");
+    }
+
+    /// `l` is a direction: it opens a closed lane, and on an open one it does
+    /// nothing so the cursor can move on into the pane. `enter` toggles.
+    #[test]
+    fn l_opens_a_closed_lane_and_never_closes_one() {
+        let mut r = sample("l-opens");
+        assert!(matches!(r.on_action(Action::Open, 0), Flow::Continue));
+        assert!(r.open[0], "l closed an open lane");
+        r.open[0] = false;
+        assert!(matches!(r.on_action(Action::Open, 0), Flow::Dirty));
+        assert!(r.open[0], "l did not open a closed lane");
+        assert!(matches!(r.on_action(Action::Activate, 0), Flow::Dirty));
+        assert!(!r.open[0], "enter did not close it");
+    }
+
     #[test]
     fn an_empty_index_says_so_instead_of_drawing_nothing() {
         let empty = std::env::temp_dir().join("github-root-empty");
@@ -556,6 +647,8 @@ mod tests {
         let rows = r.rows();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].label, "no clones found");
+        // That row is a placeholder, and no key may read it as a lane.
+        assert!(matches!(r.at(0), At::Nothing));
     }
 
     /// The column earns its place by being quiet. Thirteen rows of
