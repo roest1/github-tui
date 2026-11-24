@@ -19,12 +19,18 @@
 //! columns fill in after. `%(ahead-behind:)` needs git >= 2.41; older gits get
 //! the same table without those two numbers rather than an error.
 //!
-//! ## Checks come from the runs we already fetch
+//! ## Checks come from one list of runs
 //!
 //! A per-branch check status would be one API call per branch. But a workflow
 //! run already carries its `head_branch`, so the newest run per branch IS the
-//! check status -- and `Req::Runs` is a request this crate already makes. One
-//! call for the whole column.
+//! check status. One call for the whole column.
+//!
+//! It is this screen's own call, not the one the Actions tab makes. That one
+//! asks for a shorter page, and this one is read as plain JSON rather than
+//! through `model::Run`, for the one field that type does not keep:
+//! `head_repository`. A run started by a fork's pull request carries the
+//! FORK's branch name, and without the repository beside it a stranger's
+//! `main` is indistinguishable from this one.
 //!
 //! ## The three groups, and why "all" repeats "yours"
 //!
@@ -38,16 +44,15 @@ use std::collections::HashMap;
 use std::process::Command;
 use std::sync::Arc;
 
+use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use tui_core::{nav::Action, Flow, Pane, Row, Screen, Split, Tick};
 
-use crate::gh::{Fetcher, Got, Req};
-use crate::menu::{Act, Item, Menu};
+use crate::gh::{Fetcher, Got, Req, PAGE};
+use crate::menu::{Act, Item, Menu, Writes};
 use crate::model::Verdict;
-use crate::paint::{idx, DIM, OFF};
+use crate::paint::{idx, DIM, GRY, OFF, ORG, RED};
 use crate::time;
-
-const IN_FLIGHT: std::time::Duration = std::time::Duration::from_millis(100);
 
 #[derive(Debug, Clone, Deserialize)]
 struct ApiBranch {
@@ -61,18 +66,54 @@ struct RepoInfo {
     default_branch: Option<String>,
 }
 
+/// Which repository a ref lives in. The id, because it is the one thing about
+/// a repository that a rename, a transfer or a differently-cased remote URL
+/// does not change.
+#[derive(Debug, Clone, Deserialize)]
+struct RepoRef {
+    id: u64,
+}
+
+/// Is `head` a branch of the repository `base` is in?
+///
+/// A ref NAME says nothing about where it lives: a fork's pull request has a
+/// head called `main` as often as not. Keyed on the name alone, that pull
+/// request's number and its checks were drawn on this repository's `main`.
+/// A head with no repository is a fork that has since been deleted, so it is
+/// not here either.
+fn same_repo(head: &Option<RepoRef>, base: &Option<RepoRef>) -> bool {
+    matches!((head, base), (Some(h), Some(b)) if h.id == b.id)
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct Pr {
     number: u64,
     #[serde(default)]
     draft: bool,
-    head: PrHead,
+    head: PrSide,
+    base: PrSide,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-struct PrHead {
+struct PrSide {
     #[serde(rename = "ref")]
     name: String,
+    repo: Option<RepoRef>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ApiRun {
+    head_branch: Option<String>,
+    status: Option<String>,
+    conclusion: Option<String>,
+    head_repository: Option<RepoRef>,
+    repository: Option<RepoRef>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ApiRuns {
+    #[serde(default)]
+    workflow_runs: Vec<ApiRun>,
 }
 
 /// What local git knows about one remote branch.
@@ -142,6 +183,21 @@ fn git(dir: &std::path::Path, args: &[&str]) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// The default branch's name, from what `origin/HEAD` points at.
+///
+/// Only the remote's prefix comes off. A branch name may itself hold slashes,
+/// and taking the last segment turned `origin/release/v2` into `v2` -- a name
+/// no branch has, so there was no Default group and the real default was
+/// offered Delete and Rename like any other branch. Measured: git was then
+/// asked for ahead/behind against `origin/v2`, failed the whole command, and
+/// the table lost both columns to the fallback meant for an old git.
+fn default_of(symref: &str) -> Option<String> {
+    symref
+        .strip_prefix("refs/remotes/origin/")
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+}
+
 /// Read every local fact in five `git` calls.
 ///
 /// Synchronous, at open, which is the one place this crate shells out before
@@ -153,11 +209,8 @@ fn read_local(dir: &std::path::Path) -> Local {
     // `refs/remotes/origin/HEAD` is a local symref written by clone, so the
     // default branch is known offline. The API's `default_branch` is the
     // fallback, and it arrives later.
-    let default = git(
-        dir,
-        &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
-    )
-    .and_then(|s| s.rsplit('/').next().map(str::to_string));
+    let default =
+        git(dir, &["symbolic-ref", "refs/remotes/origin/HEAD"]).and_then(|s| default_of(&s));
     let current = git(dir, &["symbolic-ref", "--short", "HEAD"]);
     let me_email = git(dir, &["config", "user.email"]);
     let me_name = git(dir, &["config", "user.name"]);
@@ -250,27 +303,67 @@ enum At {
     Nothing,
 }
 
+/// Why something only GitHub knows is not on screen, when the reason is that
+/// GitHub refused or failed. `None` is "answered", or "not answered yet".
+///
+/// Kept per question rather than as one error, because each leaves a different
+/// column blank and a blank column otherwise reads as a fact: no lock is "not
+/// protected", no number is "no pull request".
+#[derive(Default)]
+struct Unknown {
+    branches: Option<String>,
+    prs: Option<String>,
+    checks: Option<String>,
+    default: Option<String>,
+}
+
 pub struct Branches {
     repo: String,
     dir: std::path::PathBuf,
     fetch: Arc<Fetcher>,
     local: Local,
+    /// GitHub's branch list as it last answered. `None` until it does, and
+    /// again whenever it refuses or fails -- the table is then git's alone.
+    api: Option<Vec<ApiBranch>>,
+    /// Derived by `rebuild` from `local` and `api`, never added to.
     branches: Vec<Branch>,
     /// Indices into `branches`, per group, in display order.
     groups: Vec<(Group, &'static str, Vec<usize>)>,
     open: Vec<bool>,
     prs: HashMap<String, (u64, bool)>,
+    /// The pull request list came back a full page long, so there may be more.
+    prs_cut: bool,
     checks: HashMap<String, Verdict>,
     epoch_seen: u64,
-    error: Option<String>,
+    unknown: Unknown,
     status: String,
+    /// Where the cursor is -- and, straight after this screen has moved the
+    /// rows under it, where it belongs. `initial_sel` answers with it.
     sel: usize,
-    /// A menu ran something, so the next tick re-asks.
+    /// `f` handed the terminal to a fetch, so the next tick re-asks.
     stale: bool,
+    /// Counted up by a branch's menu each time it runs something, and the
+    /// count this table was last read at. A menu that was only looked at
+    /// leaves the two equal, and nothing is asked again for it.
+    writes: Writes,
+    wrote_seen: u64,
 }
 
+/// Each asks for a full page, spelt out because a `const` cannot be built
+/// with `format!`. An answer `PAGE` long may have been cut.
 const BRANCHES: &str = "branches?per_page=100";
 const PULLS: &str = "pulls?state=open&per_page=100";
+const RUNS: &str = "actions/runs?per_page=100";
+const REPO: &str = "";
+
+/// `a`, `a and b`, `a, b and c`.
+fn listed(items: &[&str]) -> String {
+    match items {
+        [] => String::new(),
+        [one] => one.to_string(),
+        [most @ .., last] => format!("{} and {last}", most.join(", ")),
+    }
+}
 
 impl Branches {
     pub fn open(repo: &str, dir: &std::path::Path, fetch: Arc<Fetcher>) -> Self {
@@ -280,137 +373,201 @@ impl Branches {
             dir: dir.to_path_buf(),
             fetch,
             local,
+            api: None,
             branches: Vec::new(),
             groups: Vec::new(),
             open: Vec::new(),
             prs: HashMap::new(),
+            prs_cut: false,
             checks: HashMap::new(),
             epoch_seen: 0,
-            error: None,
+            unknown: Unknown::default(),
             status: String::new(),
             sel: 0,
             stale: false,
+            writes: Writes::default(),
+            wrote_seen: 0,
         };
         me.ask();
         // Drawn from local git immediately, so the table is on screen before
-        // any of the three requests land.
+        // any of the four requests land.
         me.rebuild();
         me
     }
 
-    fn path(&self, tail: &str) -> String {
-        format!("repos/{}/{tail}", self.repo)
+    fn req(&self, tail: &str) -> Req {
+        Req::Json {
+            path: format!("repos/{}/{tail}", self.repo)
+                .trim_end_matches('/')
+                .to_string(),
+        }
     }
 
     fn ask(&self) {
-        for tail in [BRANCHES, PULLS, ""] {
-            self.fetch.request(Req::Json {
-                path: self.path(tail).trim_end_matches('/').to_string(),
-            });
+        for tail in [BRANCHES, PULLS, RUNS, REPO] {
+            self.fetch.request(self.req(tail));
         }
-        self.fetch.request(Req::Runs {
-            query: "per_page=100".into(),
-        });
     }
 
     fn refresh(&self) {
-        for tail in [BRANCHES, PULLS] {
-            self.fetch.refresh(Req::Json {
-                path: self.path(tail),
-            });
-        }
-        self.fetch.refresh(Req::Runs {
-            query: "per_page=100".into(),
-        });
-    }
-
-    fn json(&self, tail: &str) -> Option<Arc<serde_json::Value>> {
-        let path = self.path(tail).trim_end_matches('/').to_string();
-        match self.fetch.get(&Req::Json { path }) {
-            Some(Got::Json(v)) => Some(v),
-            _ => None,
+        for tail in [BRANCHES, PULLS, RUNS] {
+            self.fetch.refresh(self.req(tail));
         }
     }
 
+    /// Read git again and ask GitHub again.
+    fn reread(&mut self) {
+        self.refresh();
+        self.adopt(read_local(&self.dir));
+    }
+
+    /// Take a fresh reading of local git and redraw from it at once.
+    ///
+    /// The second half is the point. A reading that waited for GitHub's answer
+    /// to be drawn left the table showing the old one in the meantime, and
+    /// for good if the answer never came.
+    fn adopt(&mut self, local: Local) {
+        self.local = local;
+        self.sync();
+    }
+
+    /// One answer, parsed. `Ok(None)` is still on its way; `Err` is GitHub
+    /// refusing or failing, kept as what it is rather than read as "nothing".
+    fn read<T: DeserializeOwned>(&self, tail: &str, what: &str) -> Result<Option<T>, String> {
+        match self.fetch.get(&self.req(tail)) {
+            Some(Got::Json(v)) => T::deserialize(v.as_ref())
+                .map(Some)
+                .map_err(|e| format!("unreadable {what}: {e}")),
+            Some(Got::Denied(d)) => Err(format!("the token may not read it: {}", d.fix())),
+            Some(Got::Failed(e)) => Err(e),
+            _ => Ok(None),
+        }
+    }
+
+    /// Take whatever GitHub has answered so far.
+    ///
+    /// A refusal or a failure EMPTIES what it was about and records why. Left
+    /// in place, last time's locks and pull request numbers would sit beside a
+    /// line saying they are unknown.
     fn sync(&mut self) {
-        if let Some(v) = self.json(BRANCHES) {
-            match serde_json::from_value::<Vec<ApiBranch>>(v.as_ref().clone()) {
-                Ok(api) => {
-                    for b in api {
-                        if let Some(existing) = self.branches.iter_mut().find(|x| x.name == b.name)
-                        {
-                            existing.protected = b.protected;
-                        } else {
-                            self.branches.push(Branch {
-                                protected: b.protected,
-                                facts: self.local.facts.get(&b.name).cloned(),
-                                name: b.name,
-                            });
-                        }
-                    }
-                    self.error = None;
-                }
-                Err(e) => self.error = Some(format!("unreadable branch list: {e}")),
+        match self.read::<Vec<ApiBranch>>(BRANCHES, "branch list") {
+            Ok(Some(api)) => {
+                self.api = Some(api);
+                self.unknown.branches = None;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                self.api = None;
+                self.unknown.branches = Some(e);
             }
         }
-        if let Some(Got::Denied(d)) = self.fetch.get(&Req::Json {
-            path: self.path(BRANCHES),
-        }) {
-            self.error = Some(d.fix());
-        }
-        if let Some(v) = self.json(PULLS) {
-            if let Ok(prs) = serde_json::from_value::<Vec<Pr>>(v.as_ref().clone()) {
+        match self.read::<Vec<Pr>>(PULLS, "pull request list") {
+            Ok(Some(prs)) => {
+                self.prs_cut = prs.len() >= PAGE;
                 self.prs = prs
                     .into_iter()
+                    .filter(|p| same_repo(&p.head.repo, &p.base.repo))
                     .map(|p| (p.head.name, (p.number, p.draft)))
                     .collect();
+                self.unknown.prs = None;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                self.prs.clear();
+                self.prs_cut = false;
+                self.unknown.prs = Some(e);
             }
         }
-        if let Some(v) = self.json("") {
-            if let Ok(info) = serde_json::from_value::<RepoInfo>(v.as_ref().clone()) {
+        match self.read::<ApiRuns>(RUNS, "run list") {
+            Ok(Some(list)) => {
+                // Newest first from the API, so the first run seen for a
+                // branch is its latest -- `entry().or_insert` keeps that one.
+                let mut seen: HashMap<String, Verdict> = HashMap::new();
+                for r in &list.workflow_runs {
+                    if !same_repo(&r.head_repository, &r.repository) {
+                        continue;
+                    }
+                    if let Some(b) = &r.head_branch {
+                        seen.entry(b.clone()).or_insert_with(|| {
+                            Verdict::of(r.status.as_deref(), r.conclusion.as_deref())
+                        });
+                    }
+                }
+                self.checks = seen;
+                self.unknown.checks = None;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                self.checks.clear();
+                self.unknown.checks = Some(e);
+            }
+        }
+        match self.read::<RepoInfo>(REPO, "repository") {
+            Ok(Some(info)) => {
                 // Only as a fallback: the local symref is authoritative for
                 // what THIS clone thinks, and it is what the ahead/behind
                 // numbers were computed against.
                 if self.local.default.is_none() {
                     self.local.default = info.default_branch;
                 }
+                self.unknown.default = None;
             }
-        }
-        if let Some(Got::Runs(runs)) = self.fetch.get(&Req::Runs {
-            query: "per_page=100".into(),
-        }) {
-            // Newest first from the API, so the first run seen for a branch is
-            // its latest -- `entry().or_insert` keeps exactly that one.
-            let mut seen: HashMap<String, Verdict> = HashMap::new();
-            for r in runs.iter() {
-                if let Some(b) = &r.head_branch {
-                    seen.entry(b.clone()).or_insert_with(|| r.verdict());
-                }
-            }
-            self.checks = seen;
+            Ok(None) => {}
+            // Worth saying only when git could not answer either: with no
+            // default there is no Default group, and the branch that should
+            // be in it is offered Delete like any other.
+            Err(e) => self.unknown.default = self.local.default.is_none().then_some(e),
         }
         self.rebuild();
     }
 
-    /// Re-derive the groups from whatever is known.
+    /// Re-derive the table and its groups from whatever is known NOW.
+    ///
+    /// From nothing, every time. This used to add to the list it already had
+    /// and never take away, and each row kept the facts it was first given:
+    /// a branch deleted or renamed from its own menu stayed in the table,
+    /// still offering Delete, and after a fetch every row went on showing the
+    /// subject, age and ahead/behind from before it.
     fn rebuild(&mut self) {
-        // Local git knows branches the API has not confirmed yet, which is how
-        // the table draws before the first response.
-        for (name, facts) in &self.local.facts {
-            if !self.branches.iter().any(|b| &b.name == name) {
-                self.branches.push(Branch {
-                    name: name.clone(),
-                    protected: false,
-                    facts: Some(facts.clone()),
-                });
+        let facts = &self.local.facts;
+        let mut branches: Vec<Branch> = self
+            .api
+            .iter()
+            .flatten()
+            .map(|b| Branch {
+                name: b.name.clone(),
+                protected: b.protected,
+                facts: facts.get(&b.name).cloned(),
+            })
+            .collect();
+        // GitHub's list, when it is the WHOLE list, says which branches exist:
+        // a remote-tracking ref it does not name is one git has yet to prune,
+        // which is what the old name looks like after a rename. Until GitHub
+        // answers, or when its answer was cut at a page, git's refs are the
+        // only word on the rest -- and that is how the table draws before the
+        // first response.
+        let whole = self.api.as_ref().is_some_and(|a| a.len() < PAGE);
+        if !whole {
+            let named: std::collections::HashSet<&str> =
+                self.api.iter().flatten().map(|b| b.name.as_str()).collect();
+            for (name, f) in facts {
+                if !named.contains(name.as_str()) {
+                    branches.push(Branch {
+                        name: name.clone(),
+                        protected: false,
+                        facts: Some(f.clone()),
+                    });
+                }
             }
         }
         let when = |b: &Branch| b.facts.as_ref().map(|f| f.when).unwrap_or(0);
-        self.branches.sort_by(|a, b| {
+        branches.sort_by(|a, b| {
             when(b)
                 .cmp(&when(a))
                 .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+                .then_with(|| a.name.cmp(&b.name))
         });
+        self.branches = branches;
 
         let def = self.local.default.clone().unwrap_or_default();
         let mut d = Vec::new();
@@ -446,6 +603,57 @@ impl Branches {
                 .collect();
         }
         self.groups = groups;
+    }
+
+    /// What the table cannot show, and why, a line each.
+    ///
+    /// Said in the footer because this screen has no pane to say it in, and a
+    /// row put above the table would push every branch down a line under the
+    /// cursor at the moment an answer landed. What is missing comes FIRST and
+    /// the reason after it, so a narrow terminal cuts the reason.
+    fn notices(&self) -> Vec<String> {
+        let mut by_reason: Vec<(&str, Vec<&str>)> = Vec::new();
+        for (what, why) in [
+            ("protection", &self.unknown.branches),
+            ("pull requests", &self.unknown.prs),
+            ("checks", &self.unknown.checks),
+            ("the default branch", &self.unknown.default),
+        ] {
+            let Some(why) = why.as_deref() else { continue };
+            // One line when they all failed the same way, which offline they do.
+            match by_reason.iter_mut().find(|(r, _)| *r == why) {
+                Some((_, whats)) => whats.push(what),
+                None => by_reason.push((why, vec![what])),
+            }
+        }
+        let mut out: Vec<String> = by_reason
+            .iter()
+            .map(|(why, whats)| format!("{RED}{} unknown{GRY} \u{2014} {why}{OFF}", listed(whats)))
+            .collect();
+        if self.api.as_ref().is_some_and(|a| a.len() >= PAGE) {
+            out.push(format!(
+                "{ORG}only github's first {PAGE} branches{GRY} \u{2014} past those, \
+                 protection is unknown and a branch git has not fetched is missing{OFF}"
+            ));
+        }
+        if self.prs_cut {
+            out.push(format!(
+                "{ORG}only the first {PAGE} open pull requests{GRY} \u{2014} a branch \
+                 past those may have one{OFF}"
+            ));
+        }
+        out
+    }
+
+    /// The row a group's heading is on.
+    fn head_row(&self, g: usize) -> usize {
+        self.groups
+            .iter()
+            .zip(&self.open)
+            .take(g)
+            // Its heading and its spacer, and its branches while it is open.
+            .map(|((_, _, ids), open)| 2 + if *open { ids.len() } else { 0 })
+            .sum()
     }
 
     fn at(&self, sel: usize) -> At {
@@ -599,6 +807,10 @@ impl Branches {
                     format!("git switch {name}"),
                     Act::Run(g(&["switch", &name])),
                 )
+                // It moves a clone onto another branch, and this is launched
+                // from anywhere -- so the clone may be one with an editor
+                // open in it that nobody is looking at.
+                .confirm()
                 .note(if have {
                     &["You already have this branch locally."]
                 } else {
@@ -616,11 +828,10 @@ impl Branches {
         items.push(Item::new(
             "Effective rules",
             format!("gh api repos/{repo}/rules/branches/{name}"),
-            Act::Open(Box::new(crate::rules::Rules::open(
-                &repo,
-                &name,
-                Arc::clone(&self.fetch),
-            ))),
+            Act::open({
+                let (repo, name, fetch) = (repo.clone(), name.clone(), Arc::clone(&self.fetch));
+                move || Box::new(crate::rules::Rules::open(&repo, &name, Arc::clone(&fetch)))
+            }),
         ));
         match self.prs.get(&name) {
             Some((n, _)) => {
@@ -706,6 +917,10 @@ impl Branches {
                         ],
                     },
                 )
+                // `gh api` neither asks nor reports, and everyone tracking
+                // the branch finds out afterwards. Asked after the field, so
+                // what is approved has the new name in it.
+                .confirm()
                 .note(&[
                     "Renames it on the remote and moves any open PR with",
                     "it. Your local branch keeps the old name until you",
@@ -713,7 +928,9 @@ impl Branches {
                 ]),
             );
             // No input needed, so no field: `gh` takes the branch as an
-            // argument and reports what it did.
+            // argument and reports what it did -- afterwards, which is not
+            // asking. It changes what every new clone and pull request
+            // targets, so it asks here.
             items.push(
                 Item::new(
                     "Set as default branch",
@@ -727,6 +944,7 @@ impl Branches {
                         name.clone(),
                     ]),
                 )
+                .confirm()
                 .note(&["Needs admin on the repo; gh says so if you have not."]),
             );
         }
@@ -757,7 +975,7 @@ impl Branches {
                 ]),
             );
         }
-        Menu::new("branch", name, items)
+        Menu::new("branch", name, items).marks(&self.writes)
     }
 }
 
@@ -784,37 +1002,45 @@ impl Screen for Branches {
         self.status.clear();
     }
 
+    /// The cursor's own row, which is row 0 on opening and the heading of a
+    /// group this screen has just closed from inside. See `Action::Close`.
+    fn initial_sel(&self) -> usize {
+        self.sel
+    }
+
     fn tick(&mut self) -> Tick {
-        if self.stale {
+        // Only the top screen ticks, so what a menu ran is first noticed
+        // here once that menu has closed.
+        let wrote = self.writes.since(&mut self.wrote_seen);
+        if wrote || self.stale {
             self.stale = false;
-            self.local = read_local(&self.dir);
-            self.refresh();
+            self.reread();
             return Tick::Changed;
         }
-        let now = self.fetch.epoch();
-        if now != self.epoch_seen {
-            self.epoch_seen = now;
+        if self.fetch.landed(&mut self.epoch_seen) {
             self.sync();
+            // "refreshing" until the last answer is in, and not after: the
+            // word is in the footer, which nothing else would ever clear.
+            if !self.fetch.pending() {
+                self.status.clear();
+            }
             return Tick::Changed;
         }
-        if self.fetch.pending() {
-            return Tick::Wake(IN_FLIGHT);
-        }
-        Tick::Idle
+        self.fetch.waiting()
     }
 
     fn rows(&mut self) -> Vec<Row> {
         if self.groups.is_empty() {
-            return vec![Row::leaf(if self.fetch.pending() {
-                "asking github\u{2026}"
-            } else {
-                "no branches found"
-            })
-            .detail(
-                self.error
-                    .clone()
-                    .unwrap_or_else(|| "nothing under refs/remotes/origin".into()),
-            )];
+            // A refusal first: it is neither still loading nor an empty repo,
+            // and with something else in flight it would be drawn as the one,
+            // and afterwards as the other.
+            let nothing_local = || "nothing under refs/remotes/origin".to_string();
+            let (label, detail) = match &self.unknown.branches {
+                Some(e) => ("could not list branches", e.clone()),
+                None if self.fetch.pending() => ("asking github\u{2026}", nothing_local()),
+                None => ("no branches found", nothing_local()),
+            };
+            return vec![Row::leaf(label).detail(detail)];
         }
         let mut rows = Vec::new();
         for (g, (_, name, ids)) in self.groups.iter().enumerate() {
@@ -845,17 +1071,30 @@ impl Screen for Branches {
     fn on_action(&mut self, action: Action, sel: usize) -> Flow {
         self.status.clear();
         match (action, self.at(sel)) {
-            (Action::Activate | Action::Open, At::Head(g)) => {
+            (Action::Activate, At::Head(g)) => {
                 self.open[g] = !self.open[g];
+                Flow::Dirty
+            }
+            // `l` is a direction: it opens what is closed and otherwise moves
+            // on. Toggling made it a second way to CLOSE a group, so leaning
+            // on it flickered the group open and shut.
+            (Action::Open, At::Head(g)) if !self.open[g] => {
+                self.open[g] = true;
                 Flow::Dirty
             }
             (Action::Close, At::Head(g)) => {
                 self.open[g] = false;
                 Flow::Dirty
             }
+            // Closing a group from one of its branches takes the cursor to
+            // the heading. Left at its old index it sat on whatever moved up
+            // into that row -- the next group's heading, or one of its
+            // branches -- and the next `enter` opened a menu for a branch
+            // nobody had been looking at.
             (Action::Close, At::Branch(g, _)) => {
                 self.open[g] = false;
-                Flow::Dirty
+                self.sel = self.head_row(g);
+                Flow::Retarget
             }
             // The three-dots. Enter on a branch opens everything you can do to
             // it, named, rather than hiding it behind keys you have to be told.
@@ -864,14 +1103,12 @@ impl Screen for Branches {
                 let Some(menu) = self.branch_at(sel).map(|b| self.menu_for(b)) else {
                     return Flow::Continue;
                 };
-                // Anything in there may change what this screen shows, so the
-                // next tick after the pop re-reads git and the API.
-                self.stale = true;
+                // Anything it runs may change what this screen shows, and
+                // the menu counts each one: see `tick`.
                 Flow::Push(Box::new(menu))
             }
             (Action::Key('r'), _) => {
-                self.local = read_local(&self.dir);
-                self.refresh();
+                self.reread();
                 self.status = "refreshing\u{2026}".into();
                 Flow::Dirty
             }
@@ -897,19 +1134,29 @@ impl Screen for Branches {
         let legend = format!(
             "{DIM}\u{25cf} here  \u{25cb} local copy  \u{2b50} default  \u{1f512} protected  \u{2191}ahead \u{2193}behind the default{OFF}"
         );
-        match self.at(self.sel) {
-            At::Head(_) => format!("enter open/close \u{b7} f fetch \u{b7} r refresh\n{legend}"),
-            At::Branch(..) => {
-                format!("enter what you can do to it \u{b7} f fetch \u{b7} r refresh\n{legend}")
-            }
-            At::Nothing => format!("f fetch \u{b7} r refresh\n{legend}"),
+        let mut keys = match self.at(self.sel) {
+            At::Head(_) => "enter open/close \u{b7} f fetch \u{b7} r refresh",
+            At::Branch(..) => "enter what you can do to it \u{b7} f fetch \u{b7} r refresh",
+            At::Nothing => "f fetch \u{b7} r refresh",
         }
+        .to_string();
+        // On the keys' own line, so the footer does not grow and shrink by a
+        // row around every refresh. The footer because there is no pane: the
+        // word used to be set and shown nowhere.
+        if !self.status.is_empty() {
+            keys.push_str(&format!(" \u{b7} {ORG}{}{OFF}", self.status));
+        }
+        let mut lines = self.notices();
+        lines.push(keys);
+        lines.push(legend);
+        lines.join("\n")
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::menu::check;
 
     fn screen() -> Branches {
         let mut b = Branches {
@@ -930,16 +1177,20 @@ mod tests {
                 me_name: Some("Riley Oest".into()),
                 facts: HashMap::new(),
             },
+            api: None,
             branches: Vec::new(),
             groups: Vec::new(),
             open: Vec::new(),
             prs: HashMap::new(),
+            prs_cut: false,
             checks: HashMap::new(),
             epoch_seen: 0,
-            error: None,
+            unknown: Unknown::default(),
             status: String::new(),
             sel: 0,
             stale: false,
+            writes: Writes::default(),
+            wrote_seen: 0,
         };
         // Two of mine, authored under DIFFERENT names but one email -- the
         // real shape on this machine, and what makes name-matching wrong.
@@ -1162,26 +1413,14 @@ mod tests {
         for name in ["main", "feat/x", "feat/y", "chore/z"] {
             let br = b.branches.iter().find(|x| x.name == name).unwrap().clone();
             for item in b.menu_for(&br).items() {
-                let argv = match &item.act {
-                    Act::Run(v) => v.clone(),
-                    Act::Prompt { argv, .. } => argv.clone(),
-                    _ => continue,
+                let Some(argv) = check::argv_of(item) else {
+                    continue;
                 };
-                match argv.first().map(String::as_str) {
-                    // Either as `--repo <slug>` or inside a `gh api` path.
-                    // Both name it, which is what actually matters.
-                    Some("gh") => assert!(
-                        argv.iter().any(|a| a.contains("roest1/dotfiles")),
-                        "{name}: {:?} names no repo: {argv:?}",
-                        item.label
-                    ),
-                    Some("git") => assert!(
-                        argv.iter().any(|a| a == "-C"),
-                        "{name}: {:?} runs git without -C: {argv:?}",
-                        item.label
-                    ),
-                    _ => {}
-                }
+                assert!(
+                    check::names_repo(argv, "roest1/dotfiles"),
+                    "{name}: {:?} names no repo, or runs git without -C: {argv:?}",
+                    item.label
+                );
             }
         }
     }
@@ -1248,5 +1487,416 @@ mod tests {
         assert!(x.badges[2].0.trim().is_empty());
         // The author and subject still arrive, which is the point.
         assert!(x.detail.as_deref().unwrap_or("").contains("work on"));
+    }
+
+    /// Put GitHub's answer to one of this screen's questions in by hand.
+    fn answer(b: &Branches, tail: &str, v: serde_json::Value) {
+        b.fetch.seed(b.req(tail), Got::Json(Arc::new(v)));
+    }
+
+    fn listing(names: &[&str]) -> serde_json::Value {
+        names
+            .iter()
+            .map(|n| serde_json::json!({"name": n, "protected": *n == "main"}))
+            .collect()
+    }
+
+    /// What `read_local` would return now, to change and hand back.
+    fn reading(b: &Branches) -> Local {
+        Local {
+            default: b.local.default.clone(),
+            current: b.local.current.clone(),
+            locals: b.local.locals.clone(),
+            me_email: b.local.me_email.clone(),
+            me_name: b.local.me_name.clone(),
+            facts: b.local.facts.clone(),
+        }
+    }
+
+    fn names(b: &Branches) -> Vec<&str> {
+        let mut n: Vec<&str> = b.branches.iter().map(|x| x.name.as_str()).collect();
+        n.sort_unstable();
+        n
+    }
+
+    /// A menu item that changes something asks first, asserted over every item
+    /// of every branch's menu. Written as the short list of commands that only
+    /// READ, so an item added later has to ask unless someone says here that
+    /// it need not -- the safe way round for a rule about deletes.
+    #[test]
+    fn everything_that_changes_something_asks_first() {
+        let mut b = screen();
+        b.open = vec![true, true, true];
+        b.prs.insert("feat/y".into(), (42, false));
+        let mut asking: Vec<String> = Vec::new();
+        for name in ["main", "feat/x", "feat/y", "chore/z"] {
+            let br = b.branches.iter().find(|x| x.name == name).unwrap().clone();
+            for item in b.menu_for(&br).items() {
+                let Some(argv) = check::argv_of(item) else {
+                    continue;
+                };
+                match check::kind(argv) {
+                    check::Kind::Reads => {}
+                    // The one writer here that stops and asks for itself: gh
+                    // wants a title and a body before it creates anything,
+                    // and a second prompt in front of that is one too many.
+                    check::Kind::GhAsks => {
+                        assert!(!item.asks, "{name}: {:?} asks twice", item.label)
+                    }
+                    check::Kind::Writes => {
+                        assert!(
+                            item.asks,
+                            "{name}: {:?} runs {argv:?} on one keypress",
+                            item.label
+                        );
+                        asking.push(item.label.clone());
+                    }
+                }
+            }
+        }
+        // And the list above did not quietly swallow the ones that matter.
+        for label in [
+            "Checkout",
+            "Rename branch",
+            "Set as default branch",
+            "Delete remote branch",
+        ] {
+            assert!(asking.iter().any(|l| l == label), "{label} was never seen");
+        }
+    }
+
+    /// The table is what git and GitHub say NOW. It used to be added to and
+    /// never taken from, with each row keeping the facts it was first given.
+    #[test]
+    fn the_table_follows_a_delete_a_rename_and_a_fetch() {
+        let mut b = screen();
+        b.open = vec![true, true, true];
+
+        // A fetch: the same branch, with a newer commit on it.
+        let mut now = reading(&b);
+        let x = now.facts.get_mut("feat/x").unwrap();
+        x.subject = "a newer commit".into();
+        x.ahead_behind = Some((9, 0));
+        b.adopt(now);
+        let rows = b.rows();
+        let x = rows.iter().find(|r| r.label.contains("feat/x")).unwrap();
+        assert_eq!(x.detail.as_deref(), Some("a newer commit"));
+        assert!(x.badges[2].0.contains('9'), "{:?}", x.badges[2].0);
+
+        // A delete: `git push --delete` drops the remote-tracking ref too.
+        let mut now = reading(&b);
+        now.facts.remove("chore/z");
+        b.adopt(now);
+        assert_eq!(names(&b), ["feat/x", "feat/y", "main"]);
+
+        // A rename happens on GitHub alone, so git still has the old ref and
+        // not the new one. GitHub's whole list is what says which exists.
+        answer(&b, BRANCHES, listing(&["main", "feat/x", "feat/renamed"]));
+        b.sync();
+        assert_eq!(names(&b), ["feat/renamed", "feat/x", "main"]);
+        b.open = vec![true; b.groups.len()];
+        let rows = b.rows();
+        let renamed = rows
+            .iter()
+            .find(|r| r.label.contains("feat/renamed"))
+            .unwrap();
+        assert_eq!(renamed.detail.as_deref(), Some("not fetched yet"));
+        assert!(!rows.iter().any(|r| r.label.contains("feat/y")));
+    }
+
+    /// One page is a hundred. A full one may have been cut, so it cannot say
+    /// which branches do NOT exist -- and the footer says the list is short,
+    /// because past the cut a missing lock is not a fact.
+    #[test]
+    fn a_cut_branch_list_drops_nothing_and_says_it_was_cut() {
+        let page: Vec<String> = (0..PAGE).map(|i| format!("b{i:03}")).collect();
+        let page: Vec<&str> = page.iter().map(String::as_str).collect();
+
+        let mut b = screen();
+        answer(&b, BRANCHES, listing(&page));
+        b.sync();
+        assert_eq!(b.branches.len(), PAGE + 4, "git's own four were dropped");
+        assert!(b.footer().contains("first 100 branches"), "{}", b.footer());
+
+        // One short of a page is the whole list, and then it does decide.
+        let mut b = screen();
+        answer(&b, BRANCHES, listing(&page[1..]));
+        b.sync();
+        assert_eq!(b.branches.len(), PAGE - 1);
+        assert!(!b.footer().contains("first 100"), "{}", b.footer());
+    }
+
+    /// A refusal is said out loud WITH the table on screen. The table draws
+    /// from git either way, so a denied branch list used to look exactly like
+    /// a repository with nothing protected.
+    #[test]
+    fn what_github_would_not_say_is_named_not_left_blank() {
+        let mut b = screen();
+        answer(&b, BRANCHES, listing(&["main", "feat/x"]));
+        b.sync();
+        assert!(b.branches.iter().any(|x| x.protected));
+        assert!(!b.footer().contains("unknown"), "{}", b.footer());
+
+        b.fetch.seed(
+            b.req(BRANCHES),
+            Got::Failed("gh: Not Found (HTTP 404)".into()),
+        );
+        b.fetch.seed(
+            b.req(PULLS),
+            Got::Denied(crate::scopes::Denied {
+                accepted: vec!["repo".into()],
+                suggest: "repo".into(),
+            }),
+        );
+        b.prs.insert("feat/x".into(), (7, false));
+        b.sync();
+        // Git's table is still there, without last time's locks or numbers...
+        assert_eq!(names(&b), ["chore/z", "feat/x", "feat/y", "main"]);
+        assert!(!b.branches.iter().any(|x| x.protected));
+        assert!(b.prs.is_empty());
+        // ...and each gap has its own reason beside it.
+        let foot = b.footer();
+        assert!(foot.contains("protection unknown"), "{foot}");
+        assert!(foot.contains("HTTP 404"), "{foot}");
+        assert!(foot.contains("pull requests unknown"), "{foot}");
+        assert!(foot.contains("gh auth refresh"), "{foot}");
+
+        // Offline, everything fails the same way: one line, not three.
+        for tail in [BRANCHES, PULLS, RUNS] {
+            b.fetch.seed(b.req(tail), Got::Failed("no network".into()));
+        }
+        b.sync();
+        let foot = b.footer();
+        assert!(
+            foot.contains("protection, pull requests and checks unknown"),
+            "{foot}"
+        );
+        assert_eq!(foot.matches("no network").count(), 1, "{foot}");
+    }
+
+    /// The row drawn in place of the table is a row, and it is nothing: no key
+    /// acts on a branch that is not there. And a failure is not drawn as
+    /// loading, nor as an empty repository.
+    #[test]
+    fn the_walk_matches_the_rows_when_there_is_no_table() {
+        let mut b = screen();
+        b.adopt(Local {
+            facts: HashMap::new(),
+            ..reading(&b)
+        });
+        let mut labels = Vec::new();
+        for failed in [false, true] {
+            if failed {
+                b.fetch
+                    .seed(b.req(BRANCHES), Got::Failed("gh: HTTP 502".into()));
+                b.sync();
+            }
+            let rows = b.rows();
+            assert_eq!(rows.len(), 1);
+            assert!(matches!(b.at(0), At::Nothing));
+            for a in [Action::Activate, Action::Open, Action::Close] {
+                assert!(matches!(b.on_action(a, 0), Flow::Continue), "{a:?} acted");
+            }
+            labels.push((rows[0].label.clone(), rows[0].detail.clone()));
+        }
+        assert_eq!(labels[0].0, "no branches found");
+        assert_eq!(labels[1].0, "could not list branches");
+        assert_eq!(labels[1].1.as_deref(), Some("gh: HTTP 502"));
+    }
+
+    /// A ref name is not a branch of THIS repository. A fork's pull request
+    /// from its own `main` put a PR number on this `main` and took "New pull
+    /// request" off its menu, and the fork's failing run coloured its checks.
+    #[test]
+    fn a_forks_branch_of_the_same_name_is_not_this_one() {
+        let mut b = screen();
+        let (here, fork) = (serde_json::json!({"id": 1}), serde_json::json!({"id": 2}));
+        answer(
+            &b,
+            PULLS,
+            serde_json::json!([
+                {"number": 9, "head": {"ref": "feat/x", "repo": fork}, "base": {"ref": "main", "repo": here}},
+                {"number": 8, "head": {"ref": "chore/z", "repo": null}, "base": {"ref": "main", "repo": here}},
+                {"number": 7, "draft": true, "head": {"ref": "feat/y", "repo": here}, "base": {"ref": "main", "repo": here}},
+            ]),
+        );
+        answer(
+            &b,
+            RUNS,
+            serde_json::json!({"workflow_runs": [
+                {"head_branch": "main", "status": "completed", "conclusion": "failure",
+                 "head_repository": fork, "repository": here},
+                {"head_branch": "main", "status": "completed", "conclusion": "success",
+                 "head_repository": here, "repository": here},
+                {"head_branch": "feat/x", "status": "in_progress", "conclusion": null,
+                 "head_repository": null, "repository": here},
+            ]}),
+        );
+        b.sync();
+        assert_eq!(b.prs.len(), 1, "{:?}", b.prs);
+        assert_eq!(b.prs.get("feat/y"), Some(&(7, true)));
+        assert_eq!(b.checks.len(), 1, "{:?}", b.checks);
+        assert_eq!(b.checks.get("main"), Some(&Verdict::Passed));
+
+        let x = b
+            .branches
+            .iter()
+            .find(|x| x.name == "feat/x")
+            .unwrap()
+            .clone();
+        let labels: Vec<String> = b.menu_for(&x).rows().into_iter().map(|r| r.label).collect();
+        assert!(labels.iter().any(|l| l == "New pull request"), "{labels:?}");
+    }
+
+    /// A branch name may hold slashes, and only the remote's prefix is not
+    /// part of it. The last segment alone named a branch that does not exist,
+    /// so nothing was the default and the real one could be deleted.
+    #[test]
+    fn a_default_branch_with_a_slash_in_it_keeps_its_whole_name() {
+        assert_eq!(
+            default_of("refs/remotes/origin/release/v2").as_deref(),
+            Some("release/v2")
+        );
+        assert_eq!(
+            default_of("refs/remotes/origin/main").as_deref(),
+            Some("main")
+        );
+        assert_eq!(default_of("refs/remotes/origin/"), None);
+        assert_eq!(default_of("refs/heads/main"), None);
+
+        let mut b = screen();
+        let mut now = reading(&b);
+        now.default = default_of("refs/remotes/origin/feat/x");
+        b.adopt(now);
+        assert!(matches!(b.groups[0].0, Group::Default));
+        let x = b.branches[b.groups[0].2[0]].clone();
+        assert_eq!(x.name, "feat/x");
+        let labels: Vec<String> = b.menu_for(&x).rows().into_iter().map(|r| r.label).collect();
+        assert!(
+            !labels
+                .iter()
+                .any(|l| l.contains("Delete") || l.contains("Rename")),
+            "{labels:?}"
+        );
+    }
+
+    /// `h` on a branch closes its group and the cursor goes to the heading.
+    /// Its old index is by then some other row: from the second of your
+    /// branches it was the heading of the group BELOW.
+    #[test]
+    fn closing_a_group_from_inside_takes_the_cursor_to_its_heading() {
+        let mut b = screen();
+        b.open = vec![true, true, true];
+        let rows = b.rows();
+        for (i, row) in rows.iter().enumerate() {
+            b.open = vec![true, true, true];
+            let At::Branch(g, _) = b.at(i) else { continue };
+            b.focus(i);
+            assert!(
+                matches!(b.on_action(Action::Close, i), Flow::Retarget),
+                "{} did not move the cursor",
+                row.label
+            );
+            assert!(!b.open[g]);
+            let landed = b.initial_sel();
+            assert!(matches!(b.at(landed), At::Head(h) if h == g));
+            assert_eq!(b.rows()[landed].label, b.groups[g].1, "from {}", row.label);
+        }
+    }
+
+    /// `l` opens a closed group and does nothing else. `enter` is the toggle.
+    #[test]
+    fn l_opens_a_group_and_never_closes_one() {
+        let mut b = screen();
+        b.open = vec![false, false, false];
+        assert!(matches!(b.on_action(Action::Open, 0), Flow::Dirty));
+        assert!(b.open[0]);
+        assert!(matches!(b.on_action(Action::Open, 0), Flow::Continue));
+        assert!(b.open[0], "a second l closed it again");
+        // And on a branch it is a direction, never the menu.
+        assert!(matches!(b.at(1), At::Branch(..)));
+        assert!(matches!(b.on_action(Action::Open, 1), Flow::Continue));
+        assert!(matches!(b.on_action(Action::Activate, 0), Flow::Dirty));
+        assert!(!b.open[0]);
+    }
+
+    /// The three answers a tick can give, in the order that matters: something
+    /// landed, something is in flight, nothing is. And "refreshing" is on
+    /// screen from `r` until the answers are in, where it used to be set and
+    /// drawn nowhere.
+    #[test]
+    fn a_refresh_is_shown_awaited_and_then_forgotten() {
+        let mut b = screen();
+        assert!(matches!(b.tick(), Tick::Idle));
+
+        b.status = "refreshing\u{2026}".into();
+        assert!(b.footer().contains("refreshing"), "{}", b.footer());
+        // Something landed: the epoch is not the one last seen.
+        b.epoch_seen = u64::MAX;
+        assert!(matches!(b.tick(), Tick::Changed));
+        assert!(!b.footer().contains("refreshing"), "{}", b.footer());
+        assert!(matches!(b.tick(), Tick::Idle));
+
+        // In flight, with the old answer still on show. Never idle: that is
+        // the screen sitting on the old table until a key is pressed. A local
+        // usage error, so nothing leaves the machine.
+        b.fetch.refresh(Req::Cmd {
+            args: vec!["--definitely-not-a-gh-flag".into()],
+        });
+        assert!(matches!(b.tick(), Tick::Wake(_) | Tick::Changed));
+    }
+
+    /// The row a branch is drawn on, with every group open.
+    fn row_of(b: &mut Branches, name: &str) -> usize {
+        b.open = vec![true, true, true];
+        (0..b.rows().len())
+            .find(|&sel| b.branch_at(sel).is_some_and(|x| x.name == name))
+            .expect("the branch is in the table")
+    }
+
+    /// A menu that ran something is followed by a re-read: the branch it
+    /// deleted or renamed is otherwise still in the table.
+    #[test]
+    fn a_menu_that_ran_something_makes_the_table_ask_again() {
+        let mut b = screen();
+        let row = row_of(&mut b, "chore/z");
+        let Flow::Push(mut menu) = b.on_action(Action::Activate, row) else {
+            panic!("enter on a branch opens its menu");
+        };
+        assert_eq!(menu.rows()[0].label, "Checkout");
+        // It asks first, and asking is not running.
+        assert!(matches!(menu.on_action(Action::Activate, 0), Flow::Dirty));
+        assert!(!matches!(b.tick(), Tick::Changed), "re-read before a `y`");
+        assert!(matches!(
+            menu.on_action(Action::Key('y'), 0),
+            Flow::Detach(_)
+        ));
+        assert!(matches!(b.tick(), Tick::Changed));
+        assert!(
+            b.fetch.get(&b.req(BRANCHES)).is_some(),
+            "github was not asked again"
+        );
+        assert!(
+            !matches!(b.tick(), Tick::Changed),
+            "asked once, not on every tick"
+        );
+    }
+
+    /// And one that was only looked at is not. The screen used to call itself
+    /// stale as the menu opened, so every look at a branch's menu re-read git
+    /// and asked GitHub three things on the way back.
+    #[test]
+    fn a_menu_that_was_only_looked_at_asks_for_nothing() {
+        let mut b = screen();
+        let row = row_of(&mut b, "chore/z");
+        assert!(matches!(b.on_action(Action::Activate, row), Flow::Push(_)));
+        assert!(!b.stale);
+        // The menu's own rules screen is on its way, so this is not idle.
+        // What it must not be is a re-read.
+        assert!(!matches!(b.tick(), Tick::Changed));
+        assert!(
+            b.fetch.get(&b.req(BRANCHES)).is_none(),
+            "asked for a menu nothing was run from"
+        );
     }
 }

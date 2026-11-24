@@ -37,3 +37,23 @@ pub fn rule(cols: u16) -> String {
     let w = (cols as usize).clamp(8, 72);
     format!("{DIM}{}{OFF}", "\u{2500}".repeat(w))
 }
+
+/// `s` as it reads on screen, with the colour taken out. For tests, which
+/// assert on the words a row or a pane says and not on how they are painted.
+#[cfg(test)]
+pub(crate) fn unstyled(s: &str) -> String {
+    let mut out = String::new();
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            for e in chars.by_ref() {
+                if e == 'm' {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}

@@ -33,16 +33,54 @@
 //! and the bash implementation had to delete cache files on rerun to avoid
 //! exactly that. Putting the attempt in the key retires the deletion.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
+
+use tui_core::Tick;
 
 use crate::model::{Job, JobList, Run, RunList};
 use crate::scopes::{self, Denied, Granted};
+
+/// How often to look again while a `gh` call is in flight.
+///
+/// `Tick::Busy` is the obvious answer and is the wrong one here. It means "wake
+/// me next frame", which is right for work that lands in milliseconds -- the
+/// font browser rasterising a specimen -- and wasteful for a network round trip
+/// measured in hundreds. Polling at 60fps through a one-second fetch is ~60
+/// redraws to notice something that could not possibly have arrived sooner,
+/// and it is the screen, not the loop, that knows which kind of work it started.
+///
+/// A tenth of a second is far below the point where a response landing feels
+/// delayed, and it is a sixth of the frames.
+pub const IN_FLIGHT: Duration = Duration::from_millis(100);
+
+/// The most GitHub returns in one page, and what every list that can be long
+/// asks for. A list that comes back this long may have been cut, and the
+/// screen showing it says so.
+pub const PAGE: usize = 100;
+
+/// Percent-encode `s` for a URL: only the unreserved characters pass through,
+/// and whichever of the rest the caller says mean themselves where this is
+/// going.
+pub(crate) fn percent(s: &str, keep: &[u8]) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ if keep.contains(&b) => out.push(b as char),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
 
 /// How long a cached artifact stays useful. Two weeks is long enough to cover
 /// "what broke when I was away" and short enough that the directory does not
@@ -63,8 +101,7 @@ struct Reply {
     ok: bool,
     headers: String,
     body: Vec<u8>,
-    /// First non-empty line of stderr, where `gh` puts the thing worth reading
-    /// -- `gh: Not Found (HTTP 404)` rather than a stack of request detail.
+    /// What `gh` said went wrong. See `first_line`.
     err: String,
 }
 
@@ -111,6 +148,25 @@ fn split_reply(raw: &[u8]) -> (String, Vec<u8>) {
     (String::new(), raw.to_vec())
 }
 
+/// The first non-empty line of stderr, where `gh` puts the thing worth reading
+/// -- `gh: Not Found (HTTP 404)` rather than a stack of request detail.
+fn first_line(stderr: &[u8], otherwise: &str) -> String {
+    String::from_utf8_lossy(stderr)
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or(otherwise)
+        .trim()
+        .to_string()
+}
+
+/// Why `gh` could not be started at all.
+fn spawn_error(e: std::io::Error) -> String {
+    match e.kind() {
+        std::io::ErrorKind::NotFound => "gh is not installed".to_string(),
+        _ => format!("could not run gh: {e}"),
+    }
+}
+
 /// One `gh api -i` call.
 ///
 /// `-i` on every call, not just the ones expected to fail. The headers are what
@@ -123,22 +179,13 @@ fn api(args: &[String]) -> Result<Reply, String> {
         .arg("-i")
         .args(args)
         .output()
-        .map_err(|e| match e.kind() {
-            std::io::ErrorKind::NotFound => "gh is not installed".to_string(),
-            _ => format!("could not run gh: {e}"),
-        })?;
+        .map_err(spawn_error)?;
     let (headers, body) = split_reply(&out.stdout);
-    let err = String::from_utf8_lossy(&out.stderr)
-        .lines()
-        .find(|l| !l.trim().is_empty())
-        .unwrap_or("gh api failed")
-        .trim()
-        .to_string();
     Ok(Reply {
         ok: out.status.success(),
         headers,
         body,
-        err,
+        err: first_line(&out.stderr, "gh api failed"),
     })
 }
 
@@ -178,6 +225,16 @@ pub enum Req {
     /// That is honest rather than a gap: a `gh pr list` that fails has failed
     /// for its own reasons, and gh says what they were on stderr.
     Cmd { args: Vec<String> },
+    /// A `gh` subcommand run for what it DOES, not for what it prints.
+    ///
+    /// `gh run rerun` and `gh run cancel` are a network round trip each, and
+    /// run on the main thread they froze the screen for it. They go through
+    /// the pool like everything else, and the answer is only whether it
+    /// worked: `Got::Json` of a null, or `Got::Failed` with gh's reason.
+    ///
+    /// Sent with `Fetcher::send`, never `request`: a command is not something
+    /// to answer from the last time it was run.
+    Do { args: Vec<String> },
     /// Any read-only endpoint whose result the caller parses itself.
     ///
     /// One variant rather than nine. The user and org screens are a dozen flat
@@ -197,7 +254,13 @@ impl Req {
             Req::Log { job } => format!("log:{job}"),
             Req::Json { path } => format!("json:{path}"),
             Req::Cmd { args } => format!("cmd:{}", args.join(" ")),
+            Req::Do { args } => format!("do:{}", args.join(" ")),
         }
+    }
+
+    /// Is the caller promising this answer can no longer change?
+    fn is_final(&self) -> bool {
+        matches!(self, Req::Jobs { persist: true, .. })
     }
 
     /// Where this answer lives between sessions, if it is allowed to.
@@ -245,7 +308,76 @@ pub enum Got {
     Failed(String),
 }
 
-type Shared = Arc<Mutex<HashMap<String, Got>>>;
+/// Three answers, not two.
+///
+/// A fetch has three outcomes, and "not yet" and "cannot" want different
+/// lines. The pane bodies used to be told about two of them, `Some` and
+/// `None`. So a request that had FAILED was handed over as "not here yet", and
+/// the pane said `fetching jobs…` for as long as anyone cared to look -- about
+/// a run whose jobs were never coming, because the token could not read them
+/// or the network was down. The Environments pane sat on `asking github…` the
+/// same way, for a repo you are only allowed to read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Maybe<T> {
+    /// Asked for and not back yet.
+    Waiting,
+    Got(T),
+    /// Not coming, and why: gh's own words, or the command that grants the
+    /// scope the token was refused for.
+    Cannot(String),
+}
+
+impl<T> Maybe<T> {
+    /// A JSON answer read as `T`, or why there is not one.
+    ///
+    /// `parse` reads the document where it is: a `&Value` is already a
+    /// `Deserializer`, so `T::deserialize(v)` needs no copy of it.
+    pub fn of<F>(got: Option<Got>, parse: F) -> Self
+    where
+        F: FnOnce(&serde_json::Value) -> Result<T, serde_json::Error>,
+    {
+        match got {
+            Some(Got::Json(v)) => match parse(&v) {
+                Ok(t) => Maybe::Got(t),
+                Err(e) => Maybe::Cannot(format!("unreadable: {e}")),
+            },
+            Some(Got::Denied(d)) => Maybe::Cannot(d.fix()),
+            Some(Got::Failed(e)) => Maybe::Cannot(e),
+            _ => Maybe::Waiting,
+        }
+    }
+
+    /// The same answer, looking at what was got through `f`.
+    ///
+    /// The bodies take slices and `&str`; the screens hold `Arc`s and
+    /// `String`s. This is `Option::as_deref` for a type with a third state.
+    pub fn view<'a, U: ?Sized>(&'a self, f: impl FnOnce(&'a T) -> &'a U) -> Maybe<&'a U> {
+        match self {
+            Maybe::Waiting => Maybe::Waiting,
+            Maybe::Got(t) => Maybe::Got(f(t)),
+            Maybe::Cannot(why) => Maybe::Cannot(why.clone()),
+        }
+    }
+}
+
+/// What has been answered, and what is on its way.
+#[derive(Default)]
+struct State {
+    answers: HashMap<String, Got>,
+    /// Every request a worker has not answered yet, first ask or refresh.
+    ///
+    /// Kept apart from `Got::Pending` because a refresh deliberately leaves the
+    /// old answer in the map to go on being drawn -- so nothing in the map
+    /// says one is in flight, and for a while nothing anywhere did. The screen
+    /// then went idle, the app blocked for an hour, and the new list was drawn
+    /// on the next keypress: `r` sat on "refreshing…" until you touched a key.
+    flying: HashSet<String>,
+    /// Jobs answers fetched once their run had FINISHED, so that is what they
+    /// are for good. One fetched while the run was live is a snapshot.
+    settled: HashSet<String>,
+}
+
+type Shared = Arc<Mutex<State>>;
 
 pub struct Fetcher {
     repo: String,
@@ -253,7 +385,13 @@ pub struct Fetcher {
     state: Shared,
     /// Bumped by a worker whenever anything lands, so a screen can notice in
     /// one atomic read instead of walking the map every frame.
+    ///
+    /// Bumped while `state` is LOCKED, in the same breath as the request
+    /// leaving `flying`, so "nothing in flight" always implies "whatever
+    /// landed has already moved this".
     epoch: Arc<AtomicU64>,
+    /// The epoch as of the last time a screen read it. See `pending`.
+    read: AtomicU64,
     /// The scopes the last response said this token has. Learned from the
     /// headers of whatever call happened to run, never probed for.
     granted: Arc<Mutex<Granted>>,
@@ -281,30 +419,30 @@ fn parse(req: &Req, bytes: Vec<u8>) -> Got {
             Ok(v) => Got::Json(Arc::new(v)),
             Err(e) => Got::Failed(format!("unreadable output from gh {}: {e}", args.join(" "))),
         },
+        // It worked, which is the whole answer. What `gh run rerun` prints
+        // on the way is prose for a terminal and is not read.
+        Req::Do { .. } => Got::Json(Arc::new(serde_json::Value::Null)),
+    }
+}
+
+/// One `gh <subcommand>` call, for the requests `gh api` never sees.
+fn cmd(req: &Req, args: &[String]) -> Got {
+    // What to say when gh failed and said nothing.
+    let silent = match req {
+        Req::Do { .. } => "gh refused",
+        _ => "gh failed",
+    };
+    match Command::new("gh").args(args).output() {
+        Ok(o) if o.status.success() => parse(req, o.stdout),
+        Ok(o) => Got::Failed(first_line(&o.stderr, silent)),
+        Err(e) => Got::Failed(spawn_error(e)),
     }
 }
 
 fn fetch(repo: &str, req: &Req, seen: &Mutex<Granted>) -> Got {
-    // `gh <subcommand>`, not `gh api`, so it takes the other route.
-    if let Req::Cmd { args } = req {
-        let out = Command::new("gh").args(args).output();
-        return match out {
-            Ok(o) if o.status.success() => parse(req, o.stdout),
-            Ok(o) => Got::Failed(
-                String::from_utf8_lossy(&o.stderr)
-                    .lines()
-                    .find(|l| !l.trim().is_empty())
-                    .unwrap_or("gh failed")
-                    .trim()
-                    .to_string(),
-            ),
-            Err(e) => Got::Failed(match e.kind() {
-                std::io::ErrorKind::NotFound => "gh is not installed".to_string(),
-                _ => format!("could not run gh: {e}"),
-            }),
-        };
-    }
     let args: Vec<String> = match req {
+        // `gh <subcommand>`, not `gh api`, so they take the other route.
+        Req::Cmd { args } | Req::Do { args } => return cmd(req, args),
         Req::Runs { query } => vec![format!("repos/{repo}/actions/runs?{query}")],
         Req::Jobs { run, .. } => vec![format!("repos/{repo}/actions/runs/{run}/jobs?per_page=100")],
         Req::Log { job } => vec![
@@ -312,8 +450,6 @@ fn fetch(repo: &str, req: &Req, seen: &Mutex<Granted>) -> Got {
             format!("repos/{repo}/actions/jobs/{job}/logs"),
         ],
         Req::Json { path } => vec![path.clone()],
-        // Handled above; `gh api` never sees it.
-        Req::Cmd { .. } => unreachable!("Cmd takes the other route"),
     };
     let reply = match api(&args) {
         Ok(r) => r,
@@ -357,11 +493,16 @@ impl Fetcher {
     /// failed jobs would open twenty connections to be polite about.
     pub fn new(repo: &str) -> Self {
         let (tx, rx) = mpsc::channel::<Req>();
-        let state: Shared = Arc::new(Mutex::new(HashMap::new()));
+        let state: Shared = Arc::default();
         let epoch = Arc::new(AtomicU64::new(0));
         let granted: Arc<Mutex<Granted>> = Arc::new(Mutex::new(Granted::default()));
         let rx = Arc::new(Mutex::new(rx));
-        for _ in 0..4 {
+        // No workers under test, so a test cannot run `gh`. Screens ask for
+        // things as they are built, and with a pool behind them one `cargo
+        // test` was a hundred-odd real calls on whoever's token was to hand.
+        // A request simply stays in flight; tests put answers in with `seed`.
+        let workers = if cfg!(test) { 0 } else { 4 };
+        for _ in 0..workers {
             let rx = Arc::clone(&rx);
             let state = Arc::clone(&state);
             let epoch = Arc::clone(&epoch);
@@ -381,18 +522,26 @@ impl Fetcher {
                     }
                 };
                 let got = fetch(&repo, &req, &granted);
-                if let Ok(mut g) = state.lock() {
-                    g.insert(req.key(), got);
+                let Ok(mut g) = state.lock() else { return };
+                let key = req.key();
+                if req.is_final() && !matches!(got, Got::Failed(_) | Got::Denied(_)) {
+                    g.settled.insert(key.clone());
                 }
+                g.flying.remove(&key);
+                g.answers.insert(key, got);
                 epoch.fetch_add(1, Ordering::Relaxed);
             });
         }
-        prune(repo);
+        // Nor does a test touch the real cache directory.
+        if !cfg!(test) {
+            prune(repo);
+        }
         Self {
             repo: repo.to_string(),
             tx,
             state,
             epoch,
+            read: AtomicU64::new(0),
             granted,
         }
     }
@@ -408,11 +557,41 @@ impl Fetcher {
     }
 
     pub fn epoch(&self) -> u64 {
-        self.epoch.load(Ordering::Relaxed)
+        let now = self.epoch.load(Ordering::Relaxed);
+        self.read.store(now, Ordering::Relaxed);
+        now
+    }
+
+    /// Has anything landed since `seen`? The first half of every `tick`.
+    ///
+    /// It reads the epoch, which is what lets `waiting` and `pending` mean
+    /// "still in flight" for the rest of that tick -- so it goes FIRST, and a
+    /// screen that calls this and then `waiting` cannot get the order wrong.
+    pub fn landed(&self, seen: &mut u64) -> bool {
+        let now = self.epoch();
+        if now == *seen {
+            return false;
+        }
+        *seen = now;
+        true
+    }
+
+    /// What a screen with nothing new to draw and no clock of its own answers
+    /// from `tick`: the short clock while anything is on its way, or an answer
+    /// landed that nobody has read yet, and idle otherwise.
+    ///
+    /// Without the first half a tab goes idle on "fetching…" with the answer
+    /// still on its way, and draws it on the next keypress.
+    pub fn waiting(&self) -> Tick {
+        if self.pending() {
+            Tick::Wake(IN_FLIGHT)
+        } else {
+            Tick::Idle
+        }
     }
 
     pub fn get(&self, req: &Req) -> Option<Got> {
-        self.state.lock().ok()?.get(&req.key()).cloned()
+        self.state.lock().ok()?.answers.get(&req.key()).cloned()
     }
 
     /// Put an answer in by hand. Tests only.
@@ -426,15 +605,43 @@ impl Fetcher {
     #[cfg(test)]
     pub fn seed(&self, req: Req, got: Got) {
         if let Ok(mut guard) = self.state.lock() {
-            guard.insert(req.key(), got);
+            guard.answers.insert(req.key(), got);
         }
     }
 
-    pub fn pending(&self) -> bool {
+    /// Call everything in flight landed, without an answer. Tests only: there
+    /// are no workers under test, so nothing asked for ever comes back.
+    #[cfg(test)]
+    pub(crate) fn settle(&self) {
+        if let Ok(mut s) = self.state.lock() {
+            s.flying.clear();
+        }
+    }
+
+    /// Is this one request on its way? Tests only: `pending` answers for all
+    /// of them at once, and a refresh leaves its old answer in the map.
+    #[cfg(test)]
+    pub(crate) fn flying(&self, req: &Req) -> bool {
         self.state
             .lock()
-            .map(|g| g.values().any(|v| matches!(v, Got::Pending)))
-            .unwrap_or(false)
+            .is_ok_and(|s| s.flying.contains(&req.key()))
+    }
+
+    /// Is there anything a screen should stay awake for?
+    ///
+    /// Something in flight, or something that LANDED since a screen last read
+    /// the epoch. The second half closes a gap every screen's `tick` has: it
+    /// reads `epoch()` and then asks this, and an answer arriving between the
+    /// two was seen by neither -- the epoch had already been read, and by now
+    /// nothing was in flight. The screen went idle on an answer it never drew.
+    /// It was a window of microseconds, which is to say a hang nobody could
+    /// reproduce.
+    pub fn pending(&self) -> bool {
+        let Ok(state) = self.state.lock() else {
+            return false;
+        };
+        !state.flying.is_empty()
+            || self.epoch.load(Ordering::Relaxed) != self.read.load(Ordering::Relaxed)
     }
 
     /// Ask once. Idempotent, so a screen can request the same thing on every
@@ -445,7 +652,14 @@ impl Fetcher {
             return;
         };
         let key = req.key();
-        if guard.contains_key(&key) {
+        if guard.answers.contains_key(&key) {
+            // A run watched to its finish has only its last LIVE snapshot,
+            // which can still show a job running. Asked for as final, and not
+            // yet fetched as final, it is fetched once more.
+            if req.is_final() && !guard.settled.contains(&key) && guard.flying.insert(key) {
+                drop(guard);
+                let _ = self.tx.send(req);
+            }
             return;
         }
         // Resolved from disk HERE rather than in the worker, which is the
@@ -454,10 +668,13 @@ impl Fetcher {
         // Pending -> queue -> thread -> Ready, so every revisit flashed
         // "fetching…" for no reason. A file read costs microseconds.
         if let Some(got) = self.cached(&req) {
-            guard.insert(key, got);
+            // Only what cannot change is ever on disk.
+            guard.settled.insert(key.clone());
+            guard.answers.insert(key, got);
             return;
         }
-        guard.insert(key, Got::Pending);
+        guard.flying.insert(key.clone());
+        guard.answers.insert(key, Got::Pending);
         drop(guard);
         let _ = self.tx.send(req);
     }
@@ -473,10 +690,32 @@ impl Fetcher {
         let Ok(mut guard) = self.state.lock() else {
             return;
         };
-        if matches!(guard.get(&req.key()), Some(Got::Pending)) {
+        let key = req.key();
+        if !guard.flying.insert(key.clone()) {
             return; // already in flight; a second copy would just race it
         }
-        guard.entry(req.key()).or_insert(Got::Pending);
+        guard.answers.entry(key).or_insert(Got::Pending);
+        drop(guard);
+        let _ = self.tx.send(req);
+    }
+
+    /// Send a command, and take down whatever the last one like it answered.
+    ///
+    /// `refresh` keeps the old answer on show while the new one is in flight,
+    /// which is right for a list and wrong for a command: its answer is
+    /// whether THIS one worked, and a second rerun of a run would otherwise
+    /// be told the first one's result before it had left the machine.
+    ///
+    /// The same command already on its way is not sent twice.
+    pub fn send(&self, req: Req) {
+        let Ok(mut guard) = self.state.lock() else {
+            return;
+        };
+        let key = req.key();
+        if !guard.flying.insert(key.clone()) {
+            return;
+        }
+        guard.answers.insert(key, Got::Pending);
         drop(guard);
         let _ = self.tx.send(req);
     }
@@ -513,6 +752,9 @@ impl Fetcher {
     }
 
     fn cached(&self, req: &Req) -> Option<Got> {
+        if cfg!(test) {
+            return None;
+        }
         let path = req.cache_path(&self.repo)?;
         let bytes = std::fs::read(&path).ok()?;
         if bytes.is_empty() {
@@ -526,7 +768,8 @@ impl Fetcher {
     }
 }
 
-/// Drop cached artifacts older than `KEEP_DAYS`, once per process.
+/// Drop cached artifacts older than `KEEP_DAYS`. Run by `Fetcher::new`, so
+/// once for each repo opened and only over that repo's directory.
 ///
 /// Best-effort throughout: a cache that cannot be pruned is a disk-space
 /// question, and failing to open a screen over it would be the wrong trade.
@@ -578,6 +821,89 @@ mod tests {
         };
         assert_eq!(live.key(), done.key());
         assert_ne!(done.key(), again.key());
+    }
+
+    /// A refresh keeps the old answer on show, so the map alone cannot say one
+    /// is in flight. `pending` has to, or the screen that asked goes idle and
+    /// the answer is drawn on the next keypress.
+    #[test]
+    fn a_refresh_in_flight_is_pending_though_the_old_answer_stays() {
+        let f = Fetcher::new("");
+        let req = Req::Cmd {
+            args: vec!["--definitely-not-a-gh-flag".into()],
+        };
+        f.seed(req.clone(), Got::Failed("the old answer".into()));
+        assert!(!f.pending(), "nothing has been asked yet");
+        f.refresh(req.clone());
+        assert!(f.pending(), "a refresh in flight went unreported");
+        assert!(
+            f.get(&req).is_some_and(|got| !matches!(got, Got::Pending)),
+            "the answer on show was cleared while the new one was in flight"
+        );
+    }
+
+    /// An answer that lands between a screen reading the epoch and asking
+    /// whether anything is pending must still keep that screen awake.
+    #[test]
+    fn an_answer_nobody_has_read_yet_is_still_pending() {
+        let f = Fetcher::new("");
+        let seen = f.epoch();
+        // What a worker does when an answer lands.
+        f.epoch.fetch_add(1, Ordering::Relaxed);
+        assert!(f.pending(), "a landed answer was not reported");
+        assert_ne!(f.epoch(), seen);
+        assert!(!f.pending(), "read, and nothing in flight");
+    }
+
+    /// The two halves of a tick, in the order every screen uses them: an
+    /// arrival is reported once, and a request in flight is the short clock
+    /// rather than an idle screen.
+    #[test]
+    fn a_tick_sees_an_arrival_once_and_stays_awake_for_what_is_in_flight() {
+        let f = Fetcher::new("");
+        let mut seen = 0;
+        assert!(!f.landed(&mut seen), "nothing has landed");
+        assert!(matches!(f.waiting(), Tick::Idle));
+        f.refresh(Req::Json {
+            path: "user".into(),
+        });
+        assert!(!f.landed(&mut seen), "asking is not an arrival");
+        assert!(matches!(f.waiting(), Tick::Wake(d) if d == IN_FLIGHT));
+        // What a worker does when an answer lands.
+        f.settle();
+        f.epoch.fetch_add(1, Ordering::Relaxed);
+        // Not yet read, so still worth waking for.
+        assert!(matches!(f.waiting(), Tick::Wake(_)));
+        assert!(f.landed(&mut seen), "an arrival went unreported");
+        assert_eq!(seen, 1);
+        assert!(!f.landed(&mut seen), "one arrival was reported twice");
+        assert!(matches!(f.waiting(), Tick::Idle));
+    }
+
+    /// A command's answer is whether THAT command worked. Sending it again
+    /// takes the old answer down, where a refresh would have left it up to
+    /// be read as the new one's; and nothing about it is kept or parsed.
+    #[test]
+    fn a_command_sent_again_does_not_answer_with_the_last_ones_result() {
+        let f = Fetcher::new("roest1/dotfiles");
+        let rerun = Req::Do {
+            args: vec!["run".into(), "rerun".into(), "7".into()],
+        };
+        assert_eq!(rerun.key(), "do:run rerun 7");
+        assert!(rerun.cache_path("roest1/dotfiles").is_none());
+        assert!(!rerun.is_final());
+        // Whatever gh printed, success is the answer.
+        assert!(
+            matches!(parse(&rerun, b"\xe2\x9c\x93 Requested rerun".to_vec()), Got::Json(v) if v.is_null())
+        );
+
+        f.seed(rerun.clone(), Got::Json(Arc::new(serde_json::Value::Null)));
+        f.send(rerun.clone());
+        assert!(f.flying(&rerun), "it was not sent");
+        assert!(
+            matches!(f.get(&rerun), Some(Got::Pending)),
+            "the first rerun's answer is standing in for the second's"
+        );
     }
 
     /// Only the immutable answers get a file. A run list is a question about

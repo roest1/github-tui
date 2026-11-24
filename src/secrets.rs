@@ -38,12 +38,10 @@ use std::time::{Duration, Instant};
 use serde::Deserialize;
 use tui_core::{nav::Action, Flow, Pane, Row, Screen, Tick};
 
-use crate::gh::{Fetcher, Got, Req};
-use crate::menu::{Act, Item, Menu};
+use crate::gh::{Fetcher, Got, Req, IN_FLIGHT};
+use crate::menu::{Act, Item, Menu, Writes};
 use crate::paint::{idx, BOLD, DIM, GRY, OFF, ORG, PUR, RED};
 use crate::time;
-
-const IN_FLIGHT: Duration = Duration::from_millis(100);
 
 /// How long the list stays good for. The same sixty seconds the fzf screen
 /// cached it for, and for the same reason: the only thing that changes a
@@ -67,9 +65,22 @@ struct Lane {
     secrets: Vec<Secret>,
     error: Option<String>,
     waiting: bool,
+    /// Whether its rows are drawn. Kept on the lane, so that it goes where
+    /// the lane goes when the environment list is read again.
+    open: bool,
 }
 
 impl Lane {
+    fn new(env: Option<String>) -> Self {
+        Self {
+            env,
+            secrets: Vec::new(),
+            error: None,
+            waiting: true,
+            open: true,
+        }
+    }
+
     fn title(&self) -> String {
         match &self.env {
             None => "\u{1f511} repository".into(),
@@ -85,19 +96,39 @@ enum At {
     Head(usize),
     Secret(usize, usize),
     New(usize),
+    /// The row that says the environments could not be listed, or were not
+    /// all listed. A row like any other, so it has a position -- and nothing
+    /// a key could act on.
+    Environments,
 }
 
 pub struct Secrets {
     repo: String,
     fetch: Arc<Fetcher>,
     lanes: Vec<Lane>,
-    open: Vec<bool>,
+    /// Why the environments could not be listed, when they could not. Without
+    /// it a failed call looked exactly like a repository that has none.
+    envs_error: Option<String>,
+    /// How many environments GitHub says there are, when that is more than
+    /// the one page asked for.
+    envs_total: usize,
     epoch_seen: u64,
     asked: Instant,
-    /// The lane a pending name belongs to, so the answer knows its scope.
-    asking: Option<usize>,
+    /// The scope a pending name belongs to -- the inner `None` is the
+    /// repository. The scope itself and not the lane's position: the lanes
+    /// are rebuilt when the environment list lands, which can happen while
+    /// the name is being typed, and a position would then name another
+    /// environment.
+    asking: Option<Option<String>>,
     status: String,
     sel: usize,
+    /// `gh secret set` was handed the terminal, so the next tick re-asks.
+    stale: bool,
+    /// Counted up by a secret's menu each time it sets or deletes, and the
+    /// count the lists were last asked for at. A menu that was only looked
+    /// at leaves the two equal, and nothing is asked again for it.
+    writes: Writes,
+    wrote_seen: u64,
 }
 
 /// The environments list, shared with the Environments screen -- same key, so
@@ -108,17 +139,24 @@ pub fn envs_req(repo: &str) -> Req {
     }
 }
 
-pub(crate) fn list_req(repo: &str, env: Option<&str>) -> Req {
-    let mut args = vec![
-        "secret".to_string(),
-        "list".into(),
-        "--repo".into(),
-        repo.to_string(),
-    ];
+/// Where a `gh secret` command acts: this repository, and one environment of
+/// it when the secret lives in one.
+///
+/// `--repo` on every one, because `github` is launched from anywhere and gh
+/// would otherwise take the repository from the working directory. No `--env`
+/// is what makes it a repository secret.
+pub(crate) fn scope_args(repo: &str, env: Option<&str>) -> Vec<String> {
+    let mut args = vec!["--repo".to_string(), repo.to_string()];
     if let Some(e) = env {
         args.push("--env".into());
         args.push(e.to_string());
     }
+    args
+}
+
+pub(crate) fn list_req(repo: &str, env: Option<&str>) -> Req {
+    let mut args = vec!["secret".to_string(), "list".into()];
+    args.extend(scope_args(repo, env));
     args.push("--json".into());
     args.push("name,updatedAt".into());
     Req::Cmd { args }
@@ -129,7 +167,7 @@ pub(crate) fn list_req(repo: &str, env: Option<&str>) -> Req {
 /// Checked here rather than left to the round trip, because the answer is
 /// deterministic and the alternative is typing a name, handing over the
 /// terminal, typing a value, and only then being told.
-fn bad_name(name: &str) -> Option<&'static str> {
+pub(crate) fn bad_name(name: &str) -> Option<&'static str> {
     let mut chars = name.chars();
     match chars.next() {
         None => return Some("a secret needs a name"),
@@ -152,21 +190,25 @@ impl Secrets {
     pub fn open(repo: &str, fetch: Arc<Fetcher>) -> Self {
         fetch.request(list_req(repo, None));
         fetch.request(envs_req(repo));
+        Self::new(repo, fetch)
+    }
+
+    /// The screen with nothing asked for yet.
+    fn new(repo: &str, fetch: Arc<Fetcher>) -> Self {
         Self {
             repo: repo.to_string(),
             fetch,
-            lanes: vec![Lane {
-                env: None,
-                secrets: Vec::new(),
-                error: None,
-                waiting: true,
-            }],
-            open: vec![true],
+            lanes: vec![Lane::new(None)],
+            envs_error: None,
+            envs_total: 0,
             epoch_seen: 0,
             asked: Instant::now(),
             asking: None,
             status: String::new(),
             sel: 0,
+            stale: false,
+            writes: Writes::default(),
+            wrote_seen: 0,
         }
     }
 
@@ -174,39 +216,42 @@ impl Secrets {
     /// the repository's secrets are on screen before the environments are
     /// known -- which is the common case, since most repos have none.
     fn sync(&mut self) {
-        if let Some(Got::Json(v)) = self.fetch.get(&envs_req(&self.repo)) {
-            #[derive(Deserialize)]
-            struct EnvNames {
-                #[serde(default)]
-                environments: Vec<Named>,
-            }
-            #[derive(Deserialize)]
-            struct Named {
-                name: String,
-            }
-            if let Ok(list) = serde_json::from_value::<EnvNames>(v.as_ref().clone()) {
-                let mut names: Vec<String> =
-                    list.environments.into_iter().map(|e| e.name).collect();
-                names.sort_by_key(|n| n.to_lowercase());
-                for name in names {
-                    if self.lanes.iter().any(|l| l.env.as_deref() == Some(&name)) {
-                        continue;
-                    }
-                    self.fetch.request(list_req(&self.repo, Some(&name)));
-                    self.lanes.push(Lane {
-                        env: Some(name),
-                        secrets: Vec::new(),
-                        error: None,
-                        waiting: true,
-                    });
-                    self.open.push(true);
+        #[derive(Deserialize)]
+        struct EnvNames {
+            #[serde(default)]
+            total_count: usize,
+            // Required, so an answer of some other shape is an error to show
+            // rather than a list of no environments to believe.
+            environments: Vec<Named>,
+        }
+        #[derive(Deserialize)]
+        struct Named {
+            name: String,
+        }
+        // A call that failed is said so on a row of its own. It used to be
+        // dropped, and the screen then showed the repository's secrets alone
+        // -- which is also exactly what a repository with no environments
+        // looks like.
+        match self.fetch.get(&envs_req(&self.repo)) {
+            Some(Got::Json(v)) => match EnvNames::deserialize(v.as_ref()) {
+                Ok(list) => {
+                    self.envs_total = list.total_count;
+                    self.envs_error = None;
+                    let mut names: Vec<String> =
+                        list.environments.into_iter().map(|e| e.name).collect();
+                    names.sort_by_key(|n| n.to_lowercase());
+                    self.relane(names);
                 }
-            }
+                Err(e) => self.envs_error = Some(format!("unreadable environment list: {e}")),
+            },
+            Some(Got::Denied(d)) => self.envs_error = Some(d.fix()),
+            Some(Got::Failed(e)) => self.envs_error = Some(e),
+            _ => {}
         }
         for lane in &mut self.lanes {
             match self.fetch.get(&list_req(&self.repo, lane.env.as_deref())) {
                 Some(Got::Json(v)) => {
-                    match serde_json::from_value::<Vec<Secret>>(v.as_ref().clone()) {
+                    match Vec::<Secret>::deserialize(v.as_ref()) {
                         Ok(mut s) => {
                             s.sort_by_key(|s| s.name.to_lowercase());
                             lane.secrets = s;
@@ -233,6 +278,45 @@ impl Secrets {
         }
     }
 
+    /// One lane per environment GitHub lists NOW, in the order just sorted.
+    ///
+    /// Rebuilt rather than appended to. Appending kept the lane of an
+    /// environment deleted in the next tab, with its `+ new secret` row still
+    /// offering to set one there, and put an environment created later after
+    /// every older one whatever its name. A lane that survives keeps what it
+    /// had fetched and whether it was open.
+    fn relane(&mut self, names: Vec<String>) {
+        let mut old: Vec<Lane> = std::mem::take(&mut self.lanes);
+        let mut take = |env: Option<&str>| {
+            let i = old.iter().position(|l| l.env.as_deref() == env)?;
+            Some(old.remove(i))
+        };
+        let mut next = vec![take(None).unwrap_or_else(|| Lane::new(None))];
+        for name in names {
+            let lane = take(Some(&name)).unwrap_or_else(|| {
+                self.fetch.request(list_req(&self.repo, Some(&name)));
+                Lane::new(Some(name))
+            });
+            next.push(lane);
+        }
+        self.lanes = next;
+    }
+
+    /// What the last row says about the environments, when there is
+    /// something to say: the list failed, or it is one page of several.
+    fn envs_note(&self) -> Option<String> {
+        if let Some(e) = &self.envs_error {
+            return Some(format!("could not list environments \u{2014} {e}"));
+        }
+        let listed = self.lanes.iter().filter(|l| l.env.is_some()).count();
+        (self.envs_total > listed).then(|| {
+            format!(
+                "only the first {listed} of {} environments are listed",
+                self.envs_total
+            )
+        })
+    }
+
     fn refresh(&mut self) {
         self.fetch.refresh(envs_req(&self.repo));
         for lane in &self.lanes {
@@ -249,7 +333,7 @@ impl Secrets {
                 return At::Head(l);
             }
             i += 1;
-            if self.open[l] {
+            if lane.open {
                 for s in 0..lane.secrets.len() {
                     if i == sel {
                         return At::Secret(l, s);
@@ -263,7 +347,24 @@ impl Secrets {
             }
             i += 1; // the spacer
         }
+        if i == sel && self.envs_note().is_some() {
+            return At::Environments;
+        }
         At::Nothing
+    }
+
+    /// The row a lane's heading is on: the same walk as `at`, stopped early.
+    fn head_row(&self, lane: usize) -> usize {
+        (0..lane)
+            .map(|l| {
+                let inside = if self.lanes[l].open {
+                    self.lanes[l].secrets.len() + 1
+                } else {
+                    0
+                };
+                1 + inside + 1
+            })
+            .sum()
     }
 
     fn settings_url(&self, sel: usize) -> String {
@@ -272,6 +373,7 @@ impl Secrets {
                 Some(_) => format!("https://github.com/{}/settings/environments", self.repo),
                 None => format!("https://github.com/{}/settings/secrets/actions", self.repo),
             },
+            At::Environments => format!("https://github.com/{}/settings/environments", self.repo),
             At::Nothing => format!("https://github.com/{}/settings/secrets/actions", self.repo),
         }
     }
@@ -280,28 +382,21 @@ impl Secrets {
     fn secret_menu(&self, lane: usize, idx: usize) -> Menu {
         let lane = &self.lanes[lane];
         let name = lane.secrets[idx].name.clone();
-        let scope = |v: &mut Vec<String>| {
-            v.push("--repo".into());
-            v.push(self.repo.clone());
-            if let Some(e) = &lane.env {
-                v.push("--env".into());
-                v.push(e.clone());
-            }
-        };
+        let scope = scope_args(&self.repo, lane.env.as_deref());
         let mut set = vec![
             "gh".to_string(),
             "secret".into(),
             "set".into(),
             name.clone(),
         ];
-        scope(&mut set);
+        set.extend(scope.iter().cloned());
         let mut del = vec![
             "gh".to_string(),
             "secret".into(),
             "delete".into(),
             name.clone(),
         ];
-        scope(&mut del);
+        del.extend(scope);
         let items = vec![
             // Not a `confirm()`: `gh` stops and asks for the value, which is
             // both the prompt and the chance to back out, and a second
@@ -323,7 +418,7 @@ impl Secrets {
             Some(e) => format!("{e} secret"),
             None => "repository secret".into(),
         };
-        Menu::new(kind, name, items)
+        Menu::new(kind, name, items).marks(&self.writes)
     }
 }
 
@@ -337,9 +432,16 @@ impl Screen for Secrets {
     }
 
     fn tick(&mut self) -> Tick {
-        let now = self.fetch.epoch();
-        if now != self.epoch_seen {
-            self.epoch_seen = now;
+        // Only the top screen ticks, so this first runs once the menu is
+        // gone. Without it a deleted secret stayed on the list, with a menu
+        // behind it, until the minute was up.
+        let wrote = self.writes.since(&mut self.wrote_seen);
+        if wrote || self.stale {
+            self.stale = false;
+            self.refresh();
+            return Tick::Changed;
+        }
+        if self.fetch.landed(&mut self.epoch_seen) {
             self.sync();
             return Tick::Changed;
         }
@@ -356,10 +458,10 @@ impl Screen for Secrets {
 
     fn rows(&mut self) -> Vec<Row> {
         let mut rows = Vec::new();
-        for (l, lane) in self.lanes.iter().enumerate() {
+        for lane in &self.lanes {
             let mut head = Row::leaf(lane.title());
             head.group = true;
-            head.expanded = self.open[l];
+            head.expanded = lane.open;
             let head = match &lane.error {
                 Some(e) => head.detail(e.clone()).badged("!", idx::RED),
                 None if lane.waiting => head.detail("asking github\u{2026}"),
@@ -369,7 +471,7 @@ impl Screen for Secrets {
                 }),
             };
             rows.push(head);
-            if !self.open[l] {
+            if !lane.open {
                 rows.push(Row::spacer());
                 continue;
             }
@@ -394,7 +496,21 @@ impl Screen for Secrets {
             rows.push(new.detail("gh secret set"));
             rows.push(Row::spacer());
         }
+        if let Some(note) = self.envs_note() {
+            let row = Row::leaf(note).detail(String::new());
+            rows.push(if self.envs_error.is_some() {
+                row.badged("!", idx::RED)
+            } else {
+                row
+            });
+        }
         rows
+    }
+
+    /// Where a group closed from inside it leaves the cursor: on its heading.
+    /// `focus` keeps this current the rest of the time.
+    fn initial_sel(&self) -> usize {
+        self.sel
     }
 
     fn pane(&mut self, sel: usize, cols: u16, _rows: u16) -> Pane {
@@ -409,6 +525,35 @@ impl Screen for Secrets {
         };
         match self.at(sel) {
             At::Nothing => {}
+            At::Environments => {
+                lines.push(format!("{BOLD}\u{1f30d} environments{OFF}"));
+                lines.push(crate::paint::rule(cols));
+                match &self.envs_error {
+                    Some(e) => {
+                        lines.push(format!("{RED}{e}{OFF}"));
+                        lines.push(String::new());
+                        lines.push(format!(
+                            "{DIM}So this is not every secret: an environment's{OFF}"
+                        ));
+                        lines.push(format!(
+                            "{DIM}are listed under it, and the environments{OFF}"
+                        ));
+                        lines.push(format!("{DIM}themselves could not be. r asks again.{OFF}"));
+                    }
+                    None => {
+                        lines.push(format!(
+                            "{DIM}GitHub has {} environments and one page of{OFF}",
+                            self.envs_total
+                        ));
+                        lines.push(format!(
+                            "{DIM}them is here, so a secret in one of the rest{OFF}"
+                        ));
+                        lines.push(format!(
+                            "{DIM}is not on this screen. o opens them all.{OFF}"
+                        ));
+                    }
+                }
+            }
             At::Head(l) => {
                 let lane = &self.lanes[l];
                 lines.push(format!("{BOLD}{}{OFF}", lane.title()));
@@ -423,13 +568,24 @@ impl Screen for Secrets {
                 lines.push(crate::paint::rule(cols));
                 if let Some(e) = &lane.error {
                     lines.push(format!("{RED}{e}{OFF}"));
-                    lines.push(String::new());
-                    lines.push(format!(
-                        "{DIM}Listing secrets needs admin on the repository.{OFF}"
-                    ));
+                    // Only where gh's own words point that way. Said after
+                    // every failure, it told someone whose network was down
+                    // to go and ask for admin.
+                    if e.contains("403") || e.contains("404") {
+                        lines.push(String::new());
+                        lines.push(format!(
+                            "{DIM}Listing secrets needs admin on the repository.{OFF}"
+                        ));
+                    }
                     return Pane { image: None, lines };
                 }
-                lines.push(format!("{} here", lane.secrets.len()));
+                // Not a count until there is an answer to count: "0 here"
+                // over a list still on its way reads as a finding.
+                if lane.waiting {
+                    lines.push(format!("{DIM}asking github\u{2026}{OFF}"));
+                } else {
+                    lines.push(format!("{} here", lane.secrets.len()));
+                }
                 lines.push(String::new());
                 write_only(&mut lines);
             }
@@ -488,21 +644,38 @@ impl Screen for Secrets {
     fn on_action(&mut self, action: Action, sel: usize) -> Flow {
         self.status.clear();
         match (action, self.at(sel)) {
-            (Action::Activate | Action::Open, At::Head(l)) => {
-                self.open[l] = !self.open[l];
+            (Action::Activate, At::Head(l)) => {
+                self.lanes[l].open = !self.lanes[l].open;
+                Flow::Dirty
+            }
+            // `l` is a direction: it opens a closed group and does nothing
+            // else. Matched together with enter it also CLOSED an open one,
+            // and since that is never "nothing happened" the pane beside the
+            // list could not be reached from a heading at all.
+            (Action::Open, At::Head(l)) if !self.lanes[l].open => {
+                self.lanes[l].open = true;
                 Flow::Dirty
             }
             (Action::Close, At::Head(l)) => {
-                self.open[l] = false;
+                self.lanes[l].open = false;
                 Flow::Dirty
             }
+            // The rows under the cursor are about to go, so say where it
+            // belongs. Left where it was, it sat on whatever moved up into
+            // that position -- the next group's heading, or one of its
+            // secrets.
             (Action::Close, At::Secret(l, _) | At::New(l)) => {
-                self.open[l] = false;
-                Flow::Dirty
+                self.lanes[l].open = false;
+                self.sel = self.head_row(l);
+                Flow::Retarget
             }
-            (Action::Activate, At::Secret(l, s)) => Flow::Push(Box::new(self.secret_menu(l, s))),
+            (Action::Activate, At::Secret(l, s)) => {
+                // Either item in there changes what this list should say,
+                // and the menu counts the one that runs: see `tick`.
+                Flow::Push(Box::new(self.secret_menu(l, s)))
+            }
             (Action::Activate, At::New(l)) => {
-                self.asking = Some(l);
+                self.asking = Some(self.lanes[l].env.clone());
                 Flow::Ask {
                     label: match &self.lanes[l].env {
                         Some(e) => format!("name of the new {e} secret"),
@@ -524,7 +697,7 @@ impl Screen for Secrets {
     }
 
     fn answered(&mut self, text: Option<String>) -> Flow {
-        let Some(l) = self.asking.take() else {
+        let Some(scope) = self.asking.take() else {
             return Flow::Continue;
         };
         let Some(name) = text.map(|t| t.trim().to_string()) else {
@@ -534,16 +707,20 @@ impl Screen for Secrets {
             self.status = why.into();
             return Flow::Dirty;
         }
-        let mut argv = vec!["gh".to_string(), "secret".into(), "set".into(), name];
-        argv.push("--repo".into());
-        argv.push(self.repo.clone());
-        if let Some(e) = &self.lanes[l].env {
-            argv.push("--env".into());
-            argv.push(e.clone());
+        // The environment can have gone from the list while the name was
+        // being typed, and a secret is not something to aim at one that may
+        // not be there.
+        if let Some(e) = &scope {
+            if !self.lanes.iter().any(|l| l.env.as_ref() == Some(e)) {
+                self.status = format!("{e} is no longer one of the environments listed");
+                return Flow::Dirty;
+            }
         }
-        // The list will not know about it until it is asked again, and the
-        // next tick is within a second of getting the terminal back.
-        self.asked = Instant::now() - LIST_EVERY;
+        let mut argv = vec!["gh".to_string(), "secret".into(), "set".into(), name];
+        argv.extend(scope_args(&self.repo, scope.as_deref()));
+        // The list will not know about it until it is asked again, which the
+        // first tick after the terminal comes back does.
+        self.stale = true;
         Flow::Detach(argv)
     }
 
@@ -555,7 +732,7 @@ impl Screen for Secrets {
             At::Head(_) => "enter open/close \u{b7} o browser \u{b7} r refresh".into(),
             At::Secret(..) => "enter set or delete \u{b7} o browser \u{b7} r refresh".into(),
             At::New(_) => "enter names it, then gh asks for the value".into(),
-            At::Nothing => "o browser \u{b7} r refresh".into(),
+            At::Environments | At::Nothing => "o browser \u{b7} r refresh".into(),
         }
     }
 }
@@ -563,6 +740,7 @@ impl Screen for Secrets {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::menu::check;
 
     fn screen() -> Secrets {
         let mut s = Secrets::open("roest1/dotfiles", Arc::new(Fetcher::new("")));
@@ -585,8 +763,8 @@ mod tests {
             }],
             error: None,
             waiting: false,
+            open: true,
         });
-        s.open.push(true);
         s
     }
 
@@ -691,15 +869,12 @@ mod tests {
     #[test]
     fn the_rows_and_the_positions_agree() {
         let mut s = screen();
-        let rows = s.rows();
-        for (i, row) in rows.iter().enumerate() {
-            match s.at(i) {
-                At::Head(l) => assert_eq!(row.label, s.lanes[l].title()),
-                At::Secret(l, x) => assert_eq!(row.label, s.lanes[l].secrets[x].name),
-                At::New(_) => assert!(row.label.starts_with("+ new"), "{}", row.label),
-                At::Nothing => assert!(!row.selectable, "{} is not a spacer", row.label),
-            }
-        }
+        rows_and_positions_agree(&mut s);
+        // With a group closed, and with nothing in any of them.
+        s.on_action(Action::Close, 0);
+        rows_and_positions_agree(&mut s);
+        let mut s = quiet();
+        rows_and_positions_agree(&mut s);
     }
 
     /// `o` goes to the page that holds what you were looking at: the repo's
@@ -727,6 +902,310 @@ mod tests {
         assert_eq!(head.badges.first().map(|b| b.0.as_str()), Some("!"));
     }
 
+    /// A screen that has asked for nothing, so an answer put in by hand is
+    /// not raced by the real one.
+    fn quiet() -> Secrets {
+        Secrets::new("roest1/dotfiles", Arc::new(Fetcher::new("")))
+    }
+
+    fn json(text: &str) -> Got {
+        Got::Json(Arc::new(serde_json::from_str(text).expect("parses")))
+    }
+
+    /// The environments list, and an empty secret list for each one named, so
+    /// that reading it asks GitHub for nothing.
+    fn seed_envs(s: &Secrets, total: usize, names: &[&str]) {
+        let list: Vec<String> = names
+            .iter()
+            .map(|n| format!(r#"{{"name":"{n}"}}"#))
+            .collect();
+        s.fetch.seed(
+            envs_req(&s.repo),
+            json(&format!(
+                r#"{{"total_count":{total},"environments":[{}]}}"#,
+                list.join(",")
+            )),
+        );
+        for n in names {
+            s.fetch.seed(list_req(&s.repo, Some(n)), json("[]"));
+        }
+    }
+
+    fn titles(s: &Secrets) -> Vec<Option<&str>> {
+        s.lanes.iter().map(|l| l.env.as_deref()).collect()
+    }
+
+    /// Every row is something `at` can name, and the one row that is not a
+    /// lane -- the note about the environments -- is nothing a key acts on.
+    fn rows_and_positions_agree(s: &mut Secrets) {
+        let rows = s.rows();
+        for (i, row) in rows.iter().enumerate() {
+            match s.at(i) {
+                At::Head(l) => assert_eq!(row.label, s.lanes[l].title()),
+                At::Secret(l, x) => assert_eq!(row.label, s.lanes[l].secrets[x].name),
+                At::New(_) => assert!(row.label.starts_with("+ new"), "{}", row.label),
+                At::Environments => {
+                    assert!(row.label.contains("environments"), "{}", row.label);
+                    assert!(matches!(s.on_action(Action::Activate, i), Flow::Continue));
+                    assert!(matches!(s.on_action(Action::Close, i), Flow::Continue));
+                }
+                At::Nothing => assert!(!row.selectable, "{} is not a spacer", row.label),
+            }
+        }
+        assert_eq!(s.at(rows.len()), At::Nothing, "past the last row");
+    }
+
+    /// The menu behind a secret can delete it or set it again, so coming back
+    /// from one that did re-asks. It used not to, and the deleted secret
+    /// stayed on the list with a menu still behind it.
+    #[test]
+    fn a_secrets_menu_that_ran_something_makes_the_list_ask_again() {
+        let mut s = screen();
+        let Flow::Push(mut menu) = s.on_action(Action::Activate, 1) else {
+            panic!("enter on a secret opens its menu");
+        };
+        // Delete asks first, and asking is not running.
+        assert!(matches!(menu.on_action(Action::Activate, 1), Flow::Dirty));
+        assert!(!matches!(s.tick(), Tick::Changed), "re-asked before a `y`");
+        assert!(matches!(
+            menu.on_action(Action::Key('y'), 1),
+            Flow::Detach(_)
+        ));
+        assert!(
+            matches!(s.tick(), Tick::Changed),
+            "the list was not re-asked after the delete"
+        );
+        assert!(
+            !matches!(s.tick(), Tick::Changed),
+            "asked once, not on every tick"
+        );
+    }
+
+    /// And one that was only looked at asks for nothing. The screen used to
+    /// call itself stale as the menu opened, so every look at a secret's menu
+    /// was a `gh secret list` per scope on the way back.
+    #[test]
+    fn a_secrets_menu_that_was_only_looked_at_asks_for_nothing() {
+        let mut s = screen();
+        assert!(matches!(s.on_action(Action::Activate, 1), Flow::Push(_)));
+        assert!(!s.stale);
+        assert!(
+            !matches!(s.tick(), Tick::Changed),
+            "re-asked for a menu nothing was run from"
+        );
+    }
+
+    /// `h` from inside a group closes it and takes the cursor to its heading.
+    /// Left at the same position it was on the NEXT group's heading, or on
+    /// one of that group's secrets.
+    #[test]
+    fn closing_a_group_from_inside_it_puts_the_cursor_on_its_heading() {
+        // From a secret in the second group, with the first still open.
+        let mut s = screen();
+        assert_eq!(s.at(6), At::Secret(1, 0));
+        assert!(matches!(s.on_action(Action::Close, 6), Flow::Retarget));
+        assert_eq!(s.at(s.initial_sel()), At::Head(1));
+        assert!(!s.lanes[1].open);
+        // From the first group's `+ new` row.
+        let mut s = screen();
+        assert_eq!(s.at(3), At::New(0));
+        assert!(matches!(s.on_action(Action::Close, 3), Flow::Retarget));
+        assert_eq!(s.at(s.initial_sel()), At::Head(0));
+        // And with the group above CLOSED, which moves every row after it.
+        let mut s = screen();
+        s.on_action(Action::Close, 0);
+        assert_eq!(s.at(3), At::Secret(1, 0));
+        assert!(matches!(s.on_action(Action::Close, 3), Flow::Retarget));
+        assert_eq!(s.initial_sel(), 2);
+        assert_eq!(s.at(2), At::Head(1));
+    }
+
+    /// The heading's row is read off the same walk as everything else.
+    #[test]
+    fn a_heading_is_where_the_walk_says_it_is() {
+        let mut s = screen();
+        for l in 0..s.lanes.len() {
+            assert_eq!(s.at(s.head_row(l)), At::Head(l));
+        }
+        s.lanes[0].open = false;
+        assert_eq!(s.at(s.head_row(1)), At::Head(1));
+    }
+
+    /// `l` opens a closed group and otherwise does nothing, which is what
+    /// lets it move on into the pane. It never closes one and never starts
+    /// naming a secret; enter does those.
+    #[test]
+    fn l_opens_a_closed_group_and_otherwise_moves_on() {
+        let mut s = screen();
+        assert!(matches!(s.on_action(Action::Open, 0), Flow::Continue));
+        assert!(s.lanes[0].open, "l closed an open group");
+        s.on_action(Action::Close, 0);
+        assert!(matches!(s.on_action(Action::Open, 0), Flow::Dirty));
+        assert!(s.lanes[0].open, "l did not open a closed group");
+        assert!(matches!(s.on_action(Action::Open, 1), Flow::Continue));
+        assert!(matches!(s.on_action(Action::Open, 3), Flow::Continue));
+        assert!(s.asking.is_none(), "l asked for a secret's name");
+        // Enter still toggles a heading.
+        assert!(matches!(s.on_action(Action::Activate, 0), Flow::Dirty));
+        assert!(!s.lanes[0].open);
+    }
+
+    /// An environments call that failed, was refused, or came back as
+    /// something else is a row saying so. Dropped, it left the repository's
+    /// secrets on their own, which is what a repo with no environments shows.
+    #[test]
+    fn environments_that_could_not_be_listed_are_said_so() {
+        let denied = crate::scopes::Denied {
+            accepted: vec!["repo".into()],
+            suggest: "repo".into(),
+        };
+        for (got, says) in [
+            (
+                Got::Failed("gh: Server Error (HTTP 502)".into()),
+                "HTTP 502",
+            ),
+            (Got::Denied(denied), "gh auth refresh"),
+            (json(r#"{"message":"hello"}"#), "unreadable"),
+        ] {
+            let mut s = quiet();
+            s.fetch.seed(envs_req(&s.repo), got);
+            s.sync();
+            let rows = s.rows();
+            let last = rows.len() - 1;
+            assert!(
+                rows[last].label.contains("could not list environments")
+                    && rows[last].label.contains(says),
+                "{says}: {:?}",
+                rows[last].label
+            );
+            assert_eq!(s.at(last), At::Environments);
+            assert!(s.pane(last, 60, 40).lines.join("\n").contains(says));
+            rows_and_positions_agree(&mut s);
+        }
+        // An answer still on its way is not a failure, and says nothing.
+        let mut s = quiet();
+        s.fetch.seed(envs_req(&s.repo), Got::Pending);
+        s.sync();
+        assert!(s.envs_note().is_none());
+        rows_and_positions_agree(&mut s);
+    }
+
+    /// The lanes are the environments GitHub lists now, in name order: one
+    /// deleted elsewhere goes, and one created later sorts into place. A lane
+    /// that stays keeps whether it was open.
+    #[test]
+    fn the_lanes_follow_the_environment_list() {
+        let mut s = quiet();
+        seed_envs(&s, 2, &["staging", "Production"]);
+        s.sync();
+        assert_eq!(titles(&s), [None, Some("Production"), Some("staging")]);
+        s.lanes[2].open = false;
+        seed_envs(&s, 2, &["staging", "canary"]);
+        s.sync();
+        assert_eq!(titles(&s), [None, Some("canary"), Some("staging")]);
+        let open: Vec<bool> = s.lanes.iter().map(|l| l.open).collect();
+        assert_eq!(open, [true, true, false], "staging forgot it was closed");
+        rows_and_positions_agree(&mut s);
+        seed_envs(&s, 0, &[]);
+        s.sync();
+        assert_eq!(titles(&s), [None]);
+    }
+
+    /// A name typed for an environment that left the list meanwhile is not
+    /// handed to gh, and one typed for another lane's position cannot be: the
+    /// answer carries the scope it was asked for.
+    #[test]
+    fn a_name_is_for_the_scope_it_was_asked_in_even_if_the_lanes_move() {
+        let mut s = quiet();
+        seed_envs(&s, 2, &["prod", "staging"]);
+        s.sync();
+        // repository: head, new, spacer; prod: head, new, spacer; staging: head, new
+        assert_eq!(s.at(7), At::New(2));
+        assert!(matches!(s.on_action(Action::Activate, 7), Flow::Ask { .. }));
+        // `canary` now sorts ahead of it, so staging is no longer lane 2.
+        seed_envs(&s, 3, &["prod", "staging", "canary"]);
+        s.sync();
+        match s.answered(Some("DEPLOY_TOKEN".into())) {
+            Flow::Detach(argv) => assert_eq!(argv.last().map(String::as_str), Some("staging")),
+            f => panic!("expected a detach, got {}", flow_name(&f)),
+        }
+        // And when the environment itself has gone, nothing runs.
+        assert!(matches!(
+            s.on_action(Action::Activate, 10),
+            Flow::Ask { .. }
+        ));
+        seed_envs(&s, 2, &["prod", "canary"]);
+        s.sync();
+        let flow = s.answered(Some("DEPLOY_TOKEN".into()));
+        assert!(!matches!(flow, Flow::Detach(_)), "set in a deleted lane");
+        assert!(s.footer().contains("no longer"), "{}", s.footer());
+    }
+
+    /// One page of environments is said to be one page.
+    #[test]
+    fn a_cut_environment_list_says_how_many_are_missing() {
+        let mut s = quiet();
+        seed_envs(&s, 140, &["prod", "staging"]);
+        s.sync();
+        let rows = s.rows();
+        let last = rows.len() - 1;
+        assert!(
+            rows[last].label.contains("first 2 of 140"),
+            "{:?}",
+            rows[last].label
+        );
+        assert_eq!(s.at(last), At::Environments);
+        rows_and_positions_agree(&mut s);
+    }
+
+    /// A lane still waiting has no count, and only an error that reads like a
+    /// refusal is put down to permissions.
+    #[test]
+    fn a_heading_pane_does_not_count_or_blame_before_it_knows() {
+        let mut s = screen();
+        s.lanes[0].secrets.clear();
+        s.lanes[0].waiting = true;
+        let text = s.pane(0, 60, 40).lines.join("\n");
+        assert!(text.contains("asking github"), "{text}");
+        assert!(!text.contains("0 here"), "{text}");
+        s.lanes[0].waiting = false;
+        assert!(s.pane(0, 60, 40).lines.join("\n").contains("0 here"));
+
+        s.lanes[0].error = Some("could not run gh: connection reset".into());
+        let text = s.pane(0, 60, 40).lines.join("\n");
+        assert!(text.contains("connection reset"), "{text}");
+        assert!(!text.contains("needs admin"), "{text}");
+        s.lanes[0].error = Some("HTTP 403: Resource not accessible".into());
+        assert!(s.pane(0, 60, 40).lines.join("\n").contains("needs admin"));
+    }
+
+    /// Everything a secret's menu can run names the repository, and the one
+    /// item that changes something without gh stopping to ask first is
+    /// confirmed. `gh secret set` is the exception by design: it stops for
+    /// the value, which is both the prompt and the way out.
+    #[test]
+    fn every_menu_item_names_the_repo_and_asks_before_it_changes_anything() {
+        let s = screen();
+        for (lane, idx) in [(0, 0), (1, 0)] {
+            let menu = s.secret_menu(lane, idx);
+            for item in menu.items() {
+                let Act::Run(argv) = &item.act else {
+                    panic!("{:?} is not a plain command", item.label);
+                };
+                assert!(
+                    check::names_repo(argv, "roest1/dotfiles"),
+                    "{:?} names no repo: {argv:?}",
+                    item.label
+                );
+                assert!(
+                    check::asks_first(item.asks, argv),
+                    "{:?} runs on one keypress: {argv:?}",
+                    item.label
+                );
+            }
+        }
+    }
+
     fn flow_name(f: &Flow) -> &'static str {
         match f {
             Flow::Continue => "Continue",
@@ -736,6 +1215,7 @@ mod tests {
             Flow::Ask { .. } => "Ask",
             Flow::Retarget => "Retarget",
             Flow::Detach(_) => "Detach",
+            Flow::DetachIn { .. } => "DetachIn",
             Flow::Quit => "Quit",
         }
     }

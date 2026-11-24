@@ -17,9 +17,9 @@ fn main() -> std::io::Result<()> {
             println!("github         your repos, and everything about one");
             println!();
             println!("No flags. Run it anywhere for all your clones under ~/github,");
-            println!("grouped by where you filed them; run it inside a repo and it");
-            println!("opens on that one, with the list still underneath — so q walks");
-            println!("up rather than quitting out of context.");
+            println!("grouped by where you filed them; run it inside a repo and the");
+            println!("list opens with that one selected, so enter is where you are");
+            println!("standing and q walks back up to the list and your account.");
             println!();
             println!("The repo list reads the disk, not the API: it opens instantly");
             println!("and works offline. Set GITHUB_DIR if your clones live");
@@ -64,8 +64,17 @@ fn main() -> std::io::Result<()> {
             // of the shell.
             let _mark = github::TabMark::set();
             let fetch = std::sync::Arc::new(github::gh::Fetcher::new(""));
+            // Who is signed in, as far as this disk knows -- nothing here may
+            // wait on the network, because nothing has been drawn yet. When
+            // it cannot be read, "me" stays unset: the pull request filters
+            // pin it as a person, so a placeholder word would be offered
+            // there as somebody to filter by.
             let me = github::user::login();
-            let user = github::user::screen(fetch, root.as_me(&me), &me);
+            let root = match &me {
+                Some(me) => root.as_me(me),
+                None => root,
+            };
+            let user = github::user::screen(fetch, root, me.as_deref());
             app::run_stack(vec![Box::new(user)])?
         }
     }

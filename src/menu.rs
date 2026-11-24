@@ -28,22 +28,60 @@
 //! tools themselves use -- so "full functionality" does NOT wait on a text
 //! input widget in `tui-core`. That was the surprise of building this.
 //!
-//! An item that only reads can still do its work in-process and return
-//! `Flow::Dirty`; `act` decides.
+//! ## How the screen underneath finds out
+//!
+//! It cannot ask: a pushed screen is gone by the time the one under it is
+//! looked at again. So a screen that wants to know hands its menus a `Writes`
+//! -- a shared count -- with `Menu::marks`, and the menu adds one each time
+//! it hands a command to the terminal. Looking at a menu and closing it adds
+//! nothing, so nothing is fetched again for it.
 
-use tui_core::{nav::Action, Flow, Pane, Row, Screen, Tick};
+use std::cell::Cell;
+use std::rc::Rc;
+
+use tui_core::{nav::Action, Flow, Pane, Row, Screen};
 
 use crate::paint::{BOLD, DIM, GRY, OFF, ORG, RED};
+
+/// How many times something may have written: to GitHub, or to a clone.
+///
+/// Shared between a screen and whatever it pushes, and read by the screen
+/// once it is on top again. A count, not a flag, because several screens can
+/// read one -- the environment list, one environment's menu and the reviewer
+/// picker do -- and each has its own copy to throw away: a flag the first of
+/// them cleared would leave the others acting on theirs. Each remembers the
+/// count it last re-read at.
+#[derive(Clone, Default)]
+pub struct Writes(Rc<Cell<u64>>);
+
+impl Writes {
+    pub(crate) fn mark(&self) {
+        self.0.set(self.0.get() + 1);
+    }
+
+    pub(crate) fn count(&self) -> u64 {
+        self.0.get()
+    }
+
+    /// Has anything been written since `seen`? Catches `seen` up, so the
+    /// answer is yes once per write however often it is asked.
+    pub(crate) fn since(&self, seen: &mut u64) -> bool {
+        let now = self.count();
+        if now == *seen {
+            return false;
+        }
+        *seen = now;
+        true
+    }
+}
 
 /// What an item does when chosen.
 pub enum Act {
     /// Hand over the terminal and run this, then come back. The program is
     /// first; nothing goes through a shell.
     Run(Vec<String>),
-    /// Open another screen on top.
-    Open(Box<dyn Screen>),
-    /// Close the menu and tell the screen underneath to re-read.
-    Back,
+    /// Open another screen on top. Built with `Act::open`.
+    Open(Opens),
     /// Ask for one line, then run `argv` with the answer appended.
     ///
     /// For the handful of actions `gh` cannot prompt for itself: it will ask
@@ -55,6 +93,29 @@ pub enum Act {
         /// The command, with `{}` standing for the answer.
         argv: Vec<String>,
     },
+}
+
+/// The screen an item opens, and how to build it again.
+pub struct Opens {
+    ready: Option<Box<dyn Screen>>,
+    make: Box<dyn Fn() -> Box<dyn Screen>>,
+}
+
+impl Act {
+    /// Open the screen `make` builds.
+    ///
+    /// Built once HERE, so whatever it asks GitHub for is already on its way
+    /// when the row is chosen -- and built again each time after that, because
+    /// the menu is still there when the screen it opened is closed. This used
+    /// to hold the one screen and hand it over, leaving a row that closed the
+    /// menu: `q` out of the rules and `enter` on the same row again did that
+    /// instead of opening them.
+    pub fn open(make: impl Fn() -> Box<dyn Screen> + 'static) -> Self {
+        Act::Open(Opens {
+            ready: Some(make()),
+            make: Box::new(make),
+        })
+    }
 }
 
 pub struct Item {
@@ -81,6 +142,9 @@ pub struct Item {
     /// pr create` stopping for a title, `gh auth refresh` printing a code and
     /// waiting -- this stays false, and there is still only one prompt.
     pub asks: bool,
+    /// Run the command from inside this directory, where it would otherwise
+    /// run wherever `github` happened to be started. See `Item::in_dir`.
+    pub dir: Option<std::path::PathBuf>,
     pub act: Act,
 }
 
@@ -101,6 +165,7 @@ impl Item {
             note: Vec::new(),
             destructive: false,
             asks: false,
+            dir: None,
             act,
         }
     }
@@ -122,6 +187,19 @@ impl Item {
     pub fn danger(mut self) -> Self {
         self.destructive = true;
         self.asks = true;
+        self
+    }
+
+    /// Run it from inside `dir`.
+    ///
+    /// For the commands that act on the git repository they are standing in
+    /// and have no flag to be told otherwise -- `gh pr checkout` fetches into
+    /// whichever clone that is. The directory is handed to the terminal with
+    /// the command (`Flow::DetachIn`) and shown with it, rather than folded
+    /// into a `sh -c 'cd …'` that the pane would then have to show instead of
+    /// the command.
+    pub fn in_dir(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
+        self.dir = Some(dir.into());
         self
     }
 }
@@ -170,9 +248,9 @@ pub struct Menu {
     kind: String,
     items: Vec<Item>,
     sel: usize,
-    /// Set once something has run, so leaving the menu tells the screen
-    /// underneath that its data is stale.
-    ran: bool,
+    /// Counted up each time a command is handed to the terminal, for the
+    /// screen underneath to read once this menu is gone. See `marks`.
+    marks: Option<Writes>,
     /// The item whose question is outstanding. The screen has to remember
     /// what it asked -- `app` carries the text and nothing else.
     asking: Option<usize>,
@@ -189,10 +267,21 @@ impl Menu {
             kind: kind.into(),
             items,
             sel: 0,
-            ran: false,
+            marks: None,
             asking: None,
             pending: None,
         }
+    }
+
+    /// Count every command this menu runs in `writes`.
+    ///
+    /// For the screen that pushes it: what it shows may be out of date once
+    /// something here has run, and only then. Marking itself stale as it
+    /// opened the menu meant a re-read for a menu that was looked at and
+    /// closed.
+    pub fn marks(mut self, writes: &Writes) -> Self {
+        self.marks = Some(writes.clone());
+        self
     }
 
     /// Either run it, or ask first.
@@ -201,14 +290,23 @@ impl Menu {
             self.pending = Some((i, argv));
             return Flow::Dirty;
         }
-        self.ran = true;
-        Flow::Detach(argv)
+        self.run(i, argv)
     }
 
-    /// Did anything run? The screen underneath reads this after the pop to
-    /// decide whether to refetch.
-    pub fn ran(&self) -> bool {
-        self.ran
+    /// Hand the command to the terminal, and count it.
+    ///
+    /// Counted as it leaves, not when it comes back: nothing here learns how
+    /// it went. A command that failed costs the screen underneath one
+    /// re-read; one that worked and went uncounted would leave it showing
+    /// what is no longer there.
+    fn run(&mut self, i: usize, argv: Vec<String>) -> Flow {
+        if let Some(writes) = &self.marks {
+            writes.mark();
+        }
+        match self.items.get(i).and_then(|item| item.dir.clone()) {
+            Some(dir) => Flow::DetachIn { dir, argv },
+            None => Flow::Detach(argv),
+        }
     }
 }
 
@@ -227,10 +325,6 @@ impl Screen for Menu {
         self.sel = sel;
     }
 
-    fn tick(&mut self) -> Tick {
-        Tick::Idle
-    }
-
     fn rows(&mut self) -> Vec<Row> {
         self.items
             .iter()
@@ -247,18 +341,29 @@ impl Screen for Menu {
 
     fn pane(&mut self, sel: usize, cols: u16, _rows: u16) -> Pane {
         let mut lines = Vec::new();
-        let Some(item) = self.items.get(sel) else {
+        // The item a `y` is waiting on, not the one under the cursor. They
+        // differ when the arrows moved it while a field was open, and the
+        // prompt then named one action above the command for another.
+        let about = self.pending.as_ref().map_or(sel, |(i, _)| *i);
+        let Some(item) = self.items.get(about) else {
             return Pane { image: None, lines };
         };
+        let wide = (cols as usize).saturating_sub(4);
+        // Where it runs is part of what runs, so it is said with the command.
+        let inside = item
+            .dir
+            .as_ref()
+            .map(|dir| format!("  {GRY}in {}{OFF}", dir.display()));
         lines.push(format!("{BOLD}{}{OFF}", item.label));
         lines.push(format!("{GRY}{}{OFF}", self.subject));
         lines.push(crate::paint::rule(cols));
         if let Some((_, argv)) = &self.pending {
             lines.push(format!("{ORG}About to run:{OFF}"));
             lines.push(String::new());
-            for line in wrap_argv(argv, cols as usize - 4) {
+            for line in wrap_argv(argv, wide) {
                 lines.push(format!("  {BOLD}{line}{OFF}"));
             }
+            lines.extend(inside.clone());
             lines.push(String::new());
             if item.destructive {
                 lines.push(format!("{RED}This cannot be undone.{OFF}"));
@@ -283,9 +388,10 @@ impl Screen for Menu {
             // have typed.
             Act::Run(argv) => {
                 lines.push(format!("{GRY}runs:{OFF}"));
-                for line in wrap_argv(argv, cols as usize - 4) {
+                for line in wrap_argv(argv, wide) {
                     lines.push(format!("  {ORG}{line}{OFF}"));
                 }
+                lines.extend(inside);
                 lines.push(String::new());
                 lines.push(format!(
                     "{DIM}on the real terminal, so it can prompt and you see{OFF}"
@@ -293,13 +399,12 @@ impl Screen for Menu {
                 lines.push(format!("{DIM}its own output.{OFF}"));
             }
             Act::Open(_) => lines.push(format!("{DIM}opens a screen{OFF}")),
-            Act::Back => lines.push(format!("{DIM}closes this menu{OFF}")),
             Act::Prompt { argv, label, .. } => {
                 lines.push(format!("{GRY}asks:{OFF}"));
                 lines.push(format!("  {ORG}{label}{OFF}"));
                 lines.push(String::new());
                 lines.push(format!("{GRY}then runs:{OFF}"));
-                for line in wrap_argv(argv, cols as usize - 4) {
+                for line in wrap_argv(argv, wide) {
                     lines.push(format!("  {ORG}{line}{OFF}"));
                 }
             }
@@ -312,12 +417,9 @@ impl Screen for Menu {
         // `y` acts; everything else withdraws. Safe by construction rather
         // than by bookkeeping -- a stale prompt cannot turn a later keystroke
         // into a delete, because the later keystroke is not a `y`.
-        if let Some((_, argv)) = self.pending.take() {
+        if let Some((i, argv)) = self.pending.take() {
             return match action {
-                Action::Key('y') | Action::Key('Y') => {
-                    self.ran = true;
-                    Flow::Detach(argv)
-                }
+                Action::Key('y') | Action::Key('Y') => self.run(i, argv),
                 _ => Flow::Dirty,
             };
         }
@@ -335,18 +437,8 @@ impl Screen for Menu {
                 let argv = argv.clone();
                 self.go(sel, argv)
             }
-            // Taken rather than cloned, because a `Box<dyn Screen>` is not
-            // cloneable and a menu item is chosen once. Re-choosing it finds
-            // `Back`, which closes the menu -- the screen it opened is on top
-            // by then anyway.
-            Act::Open(_) => {
-                let taken = std::mem::replace(&mut item.act, Act::Back);
-                match taken {
-                    Act::Open(screen) => Flow::Push(screen),
-                    _ => Flow::Continue,
-                }
-            }
-            Act::Back => Flow::Pop,
+            // The one built ahead of time, the first time; a new one after.
+            Act::Open(opens) => Flow::Push(opens.ready.take().unwrap_or_else(|| (opens.make)())),
             Act::Prompt { label, initial, .. } => {
                 let (label, initial) = (label.clone(), initial.clone());
                 self.asking = Some(sel);
@@ -389,9 +481,146 @@ impl Screen for Menu {
     }
 }
 
+/// What the structural tests ask of every command a menu offers.
+///
+/// Each screen's test walks its own menus and counts its own items. What a
+/// command has to satisfy is said once, here, so that one screen's test
+/// cannot be quietly looser than another's.
+#[cfg(test)]
+pub(crate) mod check {
+    use super::{Act, Item};
+
+    /// The command an item runs, or the template of the one it asks a name
+    /// for. `None` for an item that runs nothing.
+    pub(crate) fn argv_of(item: &Item) -> Option<&Vec<String>> {
+        match &item.act {
+            Act::Run(argv) | Act::Prompt { argv, .. } => Some(argv),
+            // Another screen, which answers for its own commands.
+            Act::Open(_) => None,
+        }
+    }
+
+    /// Does this command say which repository it means, rather than leaving
+    /// it to the working directory?
+    ///
+    /// `github` is launched from anywhere -- that is what the repo index is
+    /// for -- so a `gh` command has to name the repo and a `git` command has
+    /// to carry `-C`. The slug has to be the VALUE of `--repo`: found merely
+    /// somewhere in the arguments it could be a branch name or a field. `gh
+    /// api` has no such flag and carries it in the path, and `gh repo` takes
+    /// it as the argument after the verb.
+    pub(crate) fn names_repo(argv: &[String], slug: &str) -> bool {
+        let words: Vec<&str> = argv.iter().map(String::as_str).collect();
+        match words.as_slice() {
+            ["git", "-C", dir, ..] => !dir.is_empty(),
+            ["git", ..] => false,
+            ["gh", "api", rest @ ..] => {
+                let path = format!("repos/{slug}/");
+                rest.iter().any(|a| a.starts_with(&path))
+            }
+            ["gh", "repo", _, named, ..] => *named == slug,
+            _ => words.windows(2).any(|w| w == ["--repo", slug]),
+        }
+    }
+
+    /// Where a command stands with the rule that a change asks first.
+    #[derive(Debug, PartialEq, Eq)]
+    pub(crate) enum Kind {
+        /// It changes nothing.
+        Reads,
+        /// It changes something, and gh stops and asks for itself before it
+        /// does: a title, a comment's body, a secret's value. A second prompt
+        /// in front of that is one too many.
+        GhAsks,
+        /// Everything else, which is the safe way round for a rule about
+        /// deletes: the lists are of what need NOT ask, so a command added
+        /// later has to ask unless someone says here that it need not.
+        Writes,
+    }
+
+    pub(crate) fn kind(argv: &[String]) -> Kind {
+        let words: Vec<&str> = argv.iter().map(String::as_str).collect();
+        match words.as_slice() {
+            ["gh", "pr", "view" | "diff", ..] | ["gh", "browse", ..] => Kind::Reads,
+            ["gh", "pr", "create" | "comment", ..] | ["gh", "secret", "set", ..] => Kind::GhAsks,
+            // With no flag saying what to change, gh asks what to edit.
+            ["gh", "pr", "edit", rest @ ..] if !rest.iter().any(|a| a.starts_with("--add-")) => {
+                Kind::GhAsks
+            }
+            _ => Kind::Writes,
+        }
+    }
+
+    /// May this command run as it stands: it asks here, or it has no need to?
+    pub(crate) fn asks_first(asks: bool, argv: &[String]) -> bool {
+        asks || kind(argv) != Kind::Writes
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The shared audit refuses what it exists to refuse. A slug that is only
+    /// somewhere in the arguments does not name the repository, and a command
+    /// nobody has listed as a read has to ask.
+    #[test]
+    fn the_audit_wants_the_repo_named_and_a_write_asked_about() {
+        let v = |words: &[&str]| words.iter().map(|w| w.to_string()).collect::<Vec<_>>();
+        let slug = "roest1/dotfiles";
+        for named in [
+            v(&["gh", "pr", "merge", "7", "--repo", slug]),
+            v(&[
+                "gh",
+                "api",
+                "-X",
+                "DELETE",
+                "repos/roest1/dotfiles/environments/x",
+            ]),
+            v(&["gh", "repo", "edit", slug, "--default-branch", "main"]),
+            v(&["git", "-C", "/clone", "switch", "main"]),
+            v(&["run", "cancel", "1", "--repo", slug]),
+        ] {
+            assert!(check::names_repo(&named, slug), "{named:?}");
+        }
+        for unnamed in [
+            v(&["gh", "pr", "create", "--head", slug]),
+            v(&["gh", "pr", "merge", "7", "--repo", "someone/else"]),
+            v(&["gh", "pr", "merge", "7", "--repo"]),
+            v(&[
+                "gh",
+                "api",
+                "-X",
+                "POST",
+                "user/repos",
+                "-f",
+                "name=roest1/dotfiles",
+            ]),
+            v(&["gh", "repo", "edit", "--default-branch", slug]),
+            v(&["git", "switch", "main", "-C"]),
+        ] {
+            assert!(!check::names_repo(&unnamed, slug), "{unnamed:?}");
+        }
+
+        assert!(check::asks_first(false, &v(&["gh", "pr", "view", "7"])));
+        assert!(check::asks_first(false, &v(&["gh", "pr", "edit", "7"])));
+        assert!(check::asks_first(false, &v(&["gh", "secret", "set", "X"])));
+        for writes in [
+            v(&["gh", "pr", "merge", "7"]),
+            v(&["gh", "pr", "edit", "7", "--add-label", "x"]),
+            v(&["gh", "secret", "delete", "X"]),
+            v(&["git", "-C", "/clone", "push", "origin", "--delete", "x"]),
+        ] {
+            assert!(!check::asks_first(false, &writes), "{writes:?}");
+            assert!(check::asks_first(true, &writes), "{writes:?}");
+        }
+    }
+
+    /// `m`, and the count of what it runs.
+    fn counted(m: Menu) -> (Menu, Writes) {
+        let ran = Writes::default();
+        (m.marks(&ran), ran)
+    }
 
     fn menu() -> Menu {
         Menu::new(
@@ -406,6 +635,39 @@ mod tests {
                 Item::new("Delete", "git push --delete", Act::Run(vec!["git".into()])).danger(),
             ],
         )
+    }
+
+    /// A row that opens a screen can be chosen again once that screen is
+    /// closed. It used to be good for one go and then close the menu.
+    #[test]
+    fn a_row_that_opens_a_screen_opens_it_every_time() {
+        let mut m = Menu::new(
+            "branch",
+            "feat/x",
+            vec![Item::new(
+                "Effective rules",
+                "",
+                Act::open(|| Box::new(Menu::new("rules", "feat/x", Vec::new()))),
+            )],
+        );
+        for go in 1..=3 {
+            assert!(
+                matches!(m.on_action(Action::Activate, 0), Flow::Push(_)),
+                "enter number {go} did not open the screen"
+            );
+        }
+    }
+
+    /// The confirm names the item it is about to run, wherever the cursor is.
+    #[test]
+    fn the_confirm_is_about_the_pending_item_not_the_cursor_row() {
+        let mut m = menu();
+        m.on_action(Action::Activate, 1);
+        let text = m.pane(0, 60, 40).lines.join("\n");
+        assert!(text.contains("Delete"), "{text}");
+        assert!(text.contains("cannot be undone"), "{text}");
+        // And a pane too narrow to hold anything must not underflow.
+        m.pane(1, 2, 40);
     }
 
     /// The pane SHOWS the command. That is the confirmation -- you read what is
@@ -480,15 +742,15 @@ mod tests {
     /// `gh api -X POST` does neither. Reporting is not confirming.
     #[test]
     fn a_destructive_item_cannot_run_on_one_keypress() {
-        let mut m = menu();
+        let (mut m, ran) = counted(menu());
         // Item 1 is the delete. Enter asks rather than acting.
         assert!(matches!(m.on_action(Action::Activate, 1), Flow::Dirty));
-        assert!(!m.ran(), "it ran on the first enter");
+        assert_eq!(ran.count(), 0, "it ran on the first enter");
         assert!(m.footer().contains("y to go ahead"));
         // The pane shows the command about to run, which IS the confirmation.
         assert!(m.pane(1, 60, 40).lines.join("\n").contains("About to run"));
         assert!(matches!(m.on_action(Action::Key('y'), 1), Flow::Detach(_)));
-        assert!(m.ran());
+        assert_eq!(ran.count(), 1);
     }
 
     /// Anything that is not `y` withdraws -- including a second `enter`, which
@@ -502,13 +764,13 @@ mod tests {
             Action::Down,
             Action::Close,
         ] {
-            let mut m = menu();
+            let (mut m, ran) = counted(menu());
             m.on_action(Action::Activate, 1);
             assert!(
                 !matches!(m.on_action(a, 1), Flow::Detach(_)),
                 "{a:?} ran it"
             );
-            assert!(!m.ran(), "{a:?} ran it");
+            assert_eq!(ran.count(), 0, "{a:?} ran it");
         }
         // And moving the cursor withdraws it.
         let mut m = menu();
@@ -523,7 +785,7 @@ mod tests {
     /// with the name just typed in it rather than a template.
     #[test]
     fn a_prompt_that_confirms_shows_the_filled_command() {
-        let mut m = Menu::new(
+        let (mut m, ran) = counted(Menu::new(
             "branch",
             "feat/x",
             vec![Item::new(
@@ -536,11 +798,11 @@ mod tests {
                 },
             )
             .confirm()],
-        );
+        ));
         assert!(matches!(m.on_action(Action::Activate, 0), Flow::Ask { .. }));
         // The answer does not run it -- it asks.
         assert!(matches!(m.answered(Some("feat/y".into())), Flow::Dirty));
-        assert!(!m.ran());
+        assert_eq!(ran.count(), 0);
         let pane = m.pane(0, 60, 40).lines.join("\n");
         assert!(pane.contains("new_name=feat/y"), "{pane}");
         match m.on_action(Action::Key('y'), 0) {
@@ -549,20 +811,20 @@ mod tests {
         }
     }
 
-    /// Choosing an item detaches and records that something ran, which is how
-    /// the screen underneath knows to refetch after the pop.
+    /// Choosing an item detaches and counts it, which is how the screen
+    /// underneath knows to refetch once this menu is gone.
     #[test]
-    fn running_an_item_marks_the_menu_dirty() {
-        let mut m = menu();
-        assert!(!m.ran());
+    fn running_an_item_is_counted_for_the_screen_underneath() {
+        let (mut m, ran) = counted(menu());
+        assert_eq!(ran.count(), 0);
         assert!(matches!(m.on_action(Action::Activate, 0), Flow::Detach(_)));
-        assert!(m.ran());
+        assert_eq!(ran.count(), 1);
     }
 
     /// A prompt asks before it runs, and runs with the answer substituted.
     #[test]
     fn a_prompt_fills_the_template_with_what_was_typed() {
-        let mut m = Menu::new(
+        let (mut m, ran) = counted(Menu::new(
             "branch",
             "feat/x",
             vec![Item::new(
@@ -574,7 +836,7 @@ mod tests {
                     argv: vec!["gh".into(), "api".into(), "-f".into(), "new_name={}".into()],
                 },
             )],
-        );
+        ));
         // Enter asks rather than acting.
         match m.on_action(Action::Activate, 0) {
             Flow::Ask { label, initial } => {
@@ -583,14 +845,14 @@ mod tests {
             }
             _ => panic!("a prompt must ask first"),
         }
-        assert!(!m.ran(), "nothing has run yet");
+        assert_eq!(ran.count(), 0, "nothing has run yet");
         match m.answered(Some("  feat/y  ".into())) {
             // Trimmed: a trailing space from a paste must not become part of
             // the branch name.
             Flow::Detach(argv) => assert_eq!(argv.last().unwrap(), "new_name=feat/y"),
             _ => panic!("an answer must run the command"),
         }
-        assert!(m.ran());
+        assert_eq!(ran.count(), 1);
     }
 
     /// An abandoned or empty answer runs NOTHING. `--delete ""` is not
@@ -613,13 +875,13 @@ mod tests {
             )
         };
         for answer in [None, Some(String::new()), Some("   ".into())] {
-            let mut m = make();
+            let (mut m, ran) = counted(make());
             m.on_action(Action::Activate, 0);
             assert!(
                 !matches!(m.answered(answer.clone()), Flow::Detach(_)),
                 "{answer:?} ran a command"
             );
-            assert!(!m.ran(), "{answer:?} marked the menu as having run");
+            assert_eq!(ran.count(), 0, "{answer:?} marked the menu as having run");
         }
     }
 
@@ -627,16 +889,16 @@ mod tests {
     /// cursor happens to be on.
     #[test]
     fn an_unexpected_answer_does_nothing() {
-        let mut m = menu();
+        let (mut m, ran) = counted(menu());
         assert!(matches!(m.answered(Some("yes".into())), Flow::Continue));
-        assert!(!m.ran());
+        assert_eq!(ran.count(), 0);
     }
 
     /// Only enter acts. Every other key has to fall through, or a stray
     /// keystroke in a menu holding a delete would run it.
     #[test]
     fn no_other_key_can_trigger_an_item() {
-        let mut m = menu();
+        let (mut m, ran) = counted(menu());
         for a in [
             Action::Down,
             Action::Key('d'),
@@ -645,6 +907,6 @@ mod tests {
         ] {
             assert!(matches!(m.on_action(a, 1), Flow::Continue), "{a:?} acted");
         }
-        assert!(!m.ran());
+        assert_eq!(ran.count(), 0);
     }
 }

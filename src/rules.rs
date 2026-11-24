@@ -31,16 +31,13 @@
 //! already arrived that way and needed no code.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use serde::Deserialize;
 use serde_json::Value;
 use tui_core::{nav::Action, Flow, Pane, Row, Screen, Tick};
 
-use crate::gh::{Fetcher, Got, Req};
+use crate::gh::{self, Fetcher, Got, Req};
 use crate::paint::{idx, BOLD, DIM, GRY, OFF, ORG, RED, YEL};
-
-const IN_FLIGHT: Duration = Duration::from_millis(100);
 
 /// One rule, as `rules/branches/{branch}` returns it.
 #[derive(Debug, Clone, Deserialize)]
@@ -74,8 +71,13 @@ struct RulesetInfo {
     name: Option<String>,
     #[serde(default)]
     enforcement: Option<String>,
+    /// `None` when the answer did not say. GitHub leaves the field out
+    /// unless the caller may edit the ruleset, so on someone else's repo
+    /// that is the usual answer -- and read as an empty list it drew "no
+    /// bypass -- absolute" over a ruleset whose bypass list was merely not
+    /// shown to us.
     #[serde(default)]
-    bypass_actors: Vec<Bypass>,
+    bypass_actors: Option<Vec<Bypass>>,
 }
 
 /// One ruleset's contribution to this branch.
@@ -100,16 +102,7 @@ struct Set {
 /// set is escaped, because `#` is legal in a branch name and would otherwise
 /// start a fragment.
 fn path_branch(name: &str) -> String {
-    let mut out = String::with_capacity(name.len());
-    for b in name.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
-                out.push(b as char)
-            }
-            _ => out.push_str(&format!("%{b:02X}")),
-        }
-    }
-    out
+    gh::percent(name, b"/")
 }
 
 pub(crate) fn rules_req(repo: &str, branch: &str) -> Req {
@@ -287,7 +280,7 @@ impl Rules {
         match self.fetch.get(&rules_req(&self.repo, &self.branch)) {
             Some(Got::Json(v)) => {
                 self.answered = true;
-                match serde_json::from_value::<Vec<Rule>>(v.as_ref().clone()) {
+                match Vec::<Rule>::deserialize(v.as_ref()) {
                     Ok(rules) => {
                         self.error = None;
                         self.group(rules);
@@ -308,27 +301,31 @@ impl Rules {
         // The second round trip, one per ruleset, fired as the first answer
         // names them -- the same shape the Secrets screen uses to grow a lane
         // per environment.
+        //
+        // Read again on EVERY pass, including for a set that already has an
+        // answer. Skipping those meant `r` re-asked each ruleset and then
+        // never looked at what came back, so a bypass added since stayed
+        // "no bypass" until the screen was closed and opened again.
         for i in 0..self.sets.len() {
-            if self.sets[i].info.is_some() || self.sets[i].info_error.is_some() {
-                continue;
-            }
             let req = set_req(&self.repo, self.sets[i].id);
-            match self.fetch.get(&req) {
-                Some(Got::Json(v)) => {
-                    match serde_json::from_value::<RulesetInfo>(v.as_ref().clone()) {
-                        Ok(info) => self.sets[i].info = Some(info),
-                        Err(e) => {
-                            self.sets[i].info_error = Some(format!("unreadable ruleset: {e}"))
-                        }
-                    }
-                }
+            let (info, error) = match self.fetch.get(&req) {
+                Some(Got::Json(v)) => match RulesetInfo::deserialize(v.as_ref()) {
+                    Ok(info) => (Some(info), None),
+                    Err(e) => (None, Some(format!("unreadable ruleset: {e}"))),
+                },
                 // A ruleset you cannot read is not a failure of this screen:
                 // the rules above it still apply and are still listed. Only
                 // the bypass line is unknown, and it says so.
-                Some(Got::Denied(d)) => self.sets[i].info_error = Some(d.fix()),
-                Some(Got::Failed(e)) => self.sets[i].info_error = Some(e),
-                _ => self.fetch.request(req),
-            }
+                Some(Got::Denied(d)) => (None, Some(d.fix())),
+                Some(Got::Failed(e)) => (None, Some(e)),
+                // Not asked yet, or not back yet.
+                _ => {
+                    self.fetch.request(req);
+                    continue;
+                }
+            };
+            self.sets[i].info = info;
+            self.sets[i].info_error = error;
         }
     }
 
@@ -372,17 +369,37 @@ impl Rules {
     /// the actors needs the pane.
     fn bypass_detail(s: &Set) -> (String, u8) {
         match (&s.info, &s.info_error) {
-            (Some(i), _) => match i.bypass_actors.len() {
-                0 => ("no bypass \u{2014} absolute".into(), idx::GRN),
-                1 => ("1 can bypass".into(), idx::YEL),
-                n => (format!("{n} can bypass"), idx::YEL),
+            (Some(i), _) => match i.bypass_actors.as_ref().map(Vec::len) {
+                // The ruleset answered and kept its bypass list to itself.
+                // That is not an empty list.
+                None => ("bypass unknown".into(), idx::DIM),
+                Some(0) => ("no bypass \u{2014} absolute".into(), idx::GRN),
+                Some(1) => ("1 can bypass".into(), idx::YEL),
+                Some(n) => (format!("{n} can bypass"), idx::YEL),
             },
             (None, Some(_)) => ("bypass unknown".into(), idx::DIM),
             (None, None) => ("asking\u{2026}".into(), idx::DIM),
         }
     }
 
+    /// The row a ruleset's heading is drawn on.
+    fn head_row(&self, g: usize) -> usize {
+        self.sets
+            .iter()
+            .zip(&self.open)
+            .take(g)
+            // The heading, its rules if it is open, and the spacer.
+            .map(|(s, open)| 2 + if *open { s.rules.len() } else { 0 })
+            .sum()
+    }
+
     fn at(&self, sel: usize) -> At {
+        // The one row drawn for a failure is not the first ruleset. After a
+        // refresh failed the rulesets are still held here, and `enter` on
+        // "could not read the rules" opened and closed one out of sight.
+        if self.error.is_some() {
+            return At::Nothing;
+        }
         let mut row = 0;
         for (g, s) in self.sets.iter().enumerate() {
             if sel == row {
@@ -409,16 +426,11 @@ impl Screen for Rules {
     }
 
     fn tick(&mut self) -> Tick {
-        let now = self.fetch.epoch();
-        if now != self.epoch_seen {
-            self.epoch_seen = now;
+        if self.fetch.landed(&mut self.epoch_seen) {
             self.sync();
             return Tick::Changed;
         }
-        if self.fetch.pending() {
-            return Tick::Wake(IN_FLIGHT);
-        }
-        Tick::Idle
+        self.fetch.waiting()
     }
 
     fn rows(&mut self) -> Vec<Row> {
@@ -523,17 +535,30 @@ impl Screen for Rules {
                     lines.push(format!("{GRY}enforcement{OFF}  {e}"));
                 }
                 lines.push(String::new());
-                match (&s.info, &s.info_error) {
-                    (Some(i), _) if i.bypass_actors.is_empty() => {
+                let actors = s.info.as_ref().map(|i| i.bypass_actors.as_deref());
+                match (actors, &s.info_error) {
+                    // Answered, without the list. GitHub shows it only to
+                    // someone who may edit the ruleset.
+                    (Some(None), _) => {
+                        lines.push(format!("{RED}Who can bypass it is unknown.{OFF}"));
+                        lines.push(String::new());
+                        lines.push(format!(
+                            "{DIM}GitHub lists the bypass actors only for someone{OFF}"
+                        ));
+                        lines.push(format!(
+                            "{DIM}who can edit the ruleset, and left them out.{OFF}"
+                        ));
+                    }
+                    (Some(Some([])), _) => {
                         lines.push(format!("{ORG}Nobody can bypass it.{OFF}"));
                         lines.push(String::new());
                         lines.push(format!(
                             "{DIM}So the rules below are absolute, not advice.{OFF}"
                         ));
                     }
-                    (Some(i), _) => {
+                    (Some(Some(actors)), _) => {
                         lines.push(format!("{YEL}Can bypass:{OFF}"));
-                        for a in &i.bypass_actors {
+                        for a in actors {
                             lines.push(format!(
                                 "  {} {}  {DIM}{}{OFF}",
                                 a.actor_type.as_deref().unwrap_or("?"),
@@ -582,15 +607,38 @@ impl Screen for Rules {
         self.sel = sel;
     }
 
+    /// Where the cursor belongs after `Flow::Retarget`: where it was last
+    /// put, by the app or by a group closing under it.
+    fn initial_sel(&self) -> usize {
+        self.sel
+    }
+
     fn on_action(&mut self, action: Action, sel: usize) -> Flow {
         match (action, self.at(sel)) {
-            (Action::Activate | Action::Open, At::Head(g)) => {
+            // `l` opens a closed ruleset and does nothing else, which is what
+            // sends the app on into the pane. Sharing `enter`'s toggle, it
+            // closed an open one instead and the pane -- where the bypass
+            // actors are -- could not be reached from a heading at all.
+            (Action::Open, At::Head(g)) if !self.open[g] => {
+                self.open[g] = true;
+                Flow::Dirty
+            }
+            (Action::Activate, At::Head(g)) => {
                 self.open[g] = !self.open[g];
                 Flow::Dirty
             }
-            (Action::Close, At::Head(g)) | (Action::Close, At::Rule(g, _)) => {
+            (Action::Close, At::Head(g)) => {
                 self.open[g] = false;
                 Flow::Dirty
+            }
+            // Closing from a rule takes the row the cursor is on away, so the
+            // cursor goes to the heading. Left where it was it sat on
+            // whatever moved up into that row: from the second rule down,
+            // the NEXT ruleset's heading.
+            (Action::Close, At::Rule(g, _)) => {
+                self.open[g] = false;
+                self.sel = self.head_row(g);
+                Flow::Retarget
             }
             (Action::Key('o'), _) => {
                 // The repo's rules page, not a ruleset's: an org-sourced
@@ -612,9 +660,10 @@ impl Screen for Rules {
     }
 
     fn footer(&self) -> String {
-        // Nothing to open when nothing applies, and a footer offering a key
-        // that does nothing is the same small lie as a filter hiding rows.
-        if self.sets.is_empty() {
+        // Nothing to open when nothing applies or nothing could be read, and a
+        // footer offering a key that does nothing is the same small lie as a
+        // filter hiding rows.
+        if self.sets.is_empty() || self.error.is_some() {
             return "o browser \u{b7} r refresh".into();
         }
         "enter open/close \u{b7} o browser \u{b7} r refresh".into()
@@ -760,7 +809,7 @@ mod tests {
         r.sets[0].info = Some(RulesetInfo {
             name: Some("main-branch-rules".into()),
             enforcement: Some("active".into()),
-            bypass_actors: Vec::new(),
+            bypass_actors: Some(Vec::new()),
         });
         let (d, _) = Rules::bypass_detail(&r.sets[0]);
         assert!(d.contains("no bypass"), "{d}");
@@ -781,6 +830,135 @@ mod tests {
         };
         let (d, _) = Rules::bypass_detail(&waiting);
         assert!(d.contains("asking"), "{d}");
+    }
+
+    /// GitHub leaves `bypass_actors` out for anyone who cannot edit the
+    /// ruleset. A list that was not sent is not an empty list: only an
+    /// answer that says `[]` may claim nobody can bypass.
+    #[test]
+    fn a_ruleset_that_keeps_its_bypass_list_to_itself_is_unknown() {
+        let mut r = screen();
+        let told = |json: &str| serde_json::from_str::<RulesetInfo>(json).expect("parses");
+
+        for kept in [
+            r#"{"name":"main-branch-rules","enforcement":"active"}"#,
+            r#"{"name":"main-branch-rules","enforcement":"active","bypass_actors":null}"#,
+        ] {
+            r.sets[0].info = Some(told(kept));
+            let (d, _) = Rules::bypass_detail(&r.sets[0]);
+            assert_eq!(d, "bypass unknown", "{kept}");
+            assert!(r.rows()[0]
+                .detail
+                .as_deref()
+                .unwrap_or("")
+                .contains("unknown"));
+            let pane = r.pane(0, 60, 40).lines.join("\n");
+            assert!(pane.contains("Who can bypass it is unknown"), "{pane}");
+            assert!(!pane.contains("Nobody can bypass"), "{pane}");
+            // The rest of the answer is still used.
+            assert!(pane.contains("main-branch-rules"), "{pane}");
+        }
+
+        r.sets[0].info = Some(told(r#"{"name":"x","bypass_actors":[]}"#));
+        let (d, _) = Rules::bypass_detail(&r.sets[0]);
+        assert!(d.contains("no bypass"), "{d}");
+        assert!(r
+            .pane(0, 60, 40)
+            .lines
+            .join("\n")
+            .contains("Nobody can bypass"));
+
+        r.sets[0].info = Some(told(
+            r#"{"name":"x","bypass_actors":[{"actor_type":"Team","actor_id":7,"bypass_mode":"always"}]}"#,
+        ));
+        let (d, _) = Rules::bypass_detail(&r.sets[0]);
+        assert_eq!(d, "1 can bypass");
+        assert!(r.pane(0, 60, 40).lines.join("\n").contains("Team 7"));
+    }
+
+    /// `r` asks for each ruleset again, and what comes back is read -- in
+    /// both directions. A bypass added since must not stay "no bypass", and
+    /// a ruleset that could not be read and now can must not stay unknown.
+    #[test]
+    fn a_refreshed_ruleset_replaces_what_was_known_about_it() {
+        let mut r = screen();
+        let json = |raw: &str| {
+            Got::Json(Arc::new(
+                serde_json::from_str::<Value>(raw).expect("parses"),
+            ))
+        };
+        r.fetch.seed(rules_req(&r.repo, &r.branch), json(RAW));
+        r.fetch.seed(
+            set_req(&r.repo, 20169814),
+            json(r#"{"name":"main","bypass_actors":[]}"#),
+        );
+        r.fetch
+            .seed(set_req(&r.repo, 99), Got::Failed("HTTP 502".into()));
+        r.sync();
+        assert!(Rules::bypass_detail(&r.sets[0]).0.contains("no bypass"));
+        assert_eq!(Rules::bypass_detail(&r.sets[1]).0, "bypass unknown");
+
+        // What a refresh leaves in the fetcher once it lands.
+        r.fetch.seed(
+            set_req(&r.repo, 20169814),
+            json(r#"{"name":"main","bypass_actors":[{"actor_type":"Team","actor_id":7}]}"#),
+        );
+        r.fetch.seed(
+            set_req(&r.repo, 99),
+            json(r#"{"name":"org-wide","bypass_actors":[]}"#),
+        );
+        r.sync();
+        assert_eq!(
+            Rules::bypass_detail(&r.sets[0]).0,
+            "1 can bypass",
+            "the answer from before the refresh was kept"
+        );
+        assert!(
+            Rules::bypass_detail(&r.sets[1]).0.contains("no bypass"),
+            "a ruleset that failed once stayed unknown"
+        );
+
+        // And one that stops being readable says so rather than repeating
+        // the last thing it was told.
+        r.fetch
+            .seed(set_req(&r.repo, 20169814), Got::Failed("HTTP 502".into()));
+        r.sync();
+        assert_eq!(Rules::bypass_detail(&r.sets[0]).0, "bypass unknown");
+    }
+
+    /// `l` opens a closed ruleset and otherwise does nothing, so the app
+    /// moves on into the pane. Only `enter` closes one from its heading.
+    #[test]
+    fn l_opens_a_ruleset_and_never_closes_one() {
+        let mut r = screen();
+        assert!(r.open[0]);
+        assert!(matches!(r.on_action(Action::Open, 0), Flow::Continue));
+        assert!(r.open[0], "l closed an open ruleset");
+        assert!(matches!(r.on_action(Action::Open, 1), Flow::Continue));
+
+        assert!(matches!(r.on_action(Action::Activate, 0), Flow::Dirty));
+        assert!(!r.open[0]);
+        assert!(matches!(r.on_action(Action::Open, 0), Flow::Dirty));
+        assert!(r.open[0]);
+    }
+
+    /// `h` on a rule closes its ruleset and takes the cursor to the heading.
+    /// The row it was on is gone, and what moves up into it belongs to the
+    /// next ruleset.
+    #[test]
+    fn closing_from_a_rule_puts_the_cursor_on_its_heading() {
+        for (g, k) in [(0, 0), (0, 2), (0, 3), (1, 0)] {
+            let mut r = screen();
+            let from = (0..r.rows().len())
+                .find(|&i| r.at(i) == At::Rule(g, k))
+                .expect("the rule is drawn");
+            r.focus(from);
+            assert!(matches!(r.on_action(Action::Close, from), Flow::Retarget));
+            assert!(!r.open[g]);
+            let to = r.initial_sel();
+            assert_eq!(r.at(to), At::Head(g), "from rule {k} of ruleset {g}");
+            assert!(r.rows()[to].group);
+        }
     }
 
     /// The `At` walk and `rows()` are two readings of one list, in every shape
@@ -810,6 +988,23 @@ mod tests {
                 }
             }
         }
+        // A refresh that failed draws one row over rulesets that are still
+        // held, and nothing walks to it either -- so no key opens or closes
+        // one of them out of sight.
+        r.open = vec![true, true];
+        r.error = Some("HTTP 502".into());
+        assert_eq!(r.rows().len(), 1);
+        assert_eq!(r.at(0), At::Nothing);
+        for key in [Action::Activate, Action::Open, Action::Close] {
+            assert!(
+                matches!(r.on_action(key, 0), Flow::Continue),
+                "{key:?} acted on a ruleset behind the error row"
+            );
+        }
+        assert_eq!(r.open, vec![true, true]);
+        assert!(!r.footer().contains("enter"), "{}", r.footer());
+        r.error = None;
+
         // The empty shape still draws one row, and nothing walks to it.
         r.sets.clear();
         r.open.clear();
