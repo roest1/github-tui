@@ -175,8 +175,13 @@ mod tests {
     /// for -- the file is only complete once it has exited.
     ///
     /// Linux only, because `/proc` is how a process is asked what its
-    /// descriptors are. `$$` rather than `self`, since each `readlink` has
-    /// its own stdout pointed at the file and it is the shell's that matter.
+    /// descriptors are. `$$` rather than `self`, since it is the shell's
+    /// streams that matter and not `readlink`'s.
+    ///
+    /// The answers are collected first and written afterwards. Appending each
+    /// one with `>> file` passed under bash and failed under dash, which is
+    /// `sh` on the CI runner: there the shell itself reported the file as its
+    /// stdout while the redirected command ran.
     #[cfg(target_os = "linux")]
     #[test]
     fn a_spawned_opener_shares_no_stream_with_the_terminal() {
@@ -185,7 +190,10 @@ mod tests {
         let reaper = spawn_apart(
             std::process::Command::new("sh")
                 .arg("-c")
-                .arg(r#"for fd in 0 1 2; do readlink /proc/$$/fd/$fd >> "$0"; done"#)
+                .arg(
+                    r#"seen=$(for fd in 0 1 2; do readlink /proc/$$/fd/$fd; done)
+                    printf '%s\n' "$seen" > "$0""#,
+                )
                 .arg(&seen),
         )
         .expect("sh runs");
